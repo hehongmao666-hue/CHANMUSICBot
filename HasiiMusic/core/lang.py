@@ -16,14 +16,12 @@ from HasiiMusic import db, logger
 # supported languages and their display names
 lang_codes = {
     "en": "🇺🇸 English",
-    "si": "🇱🇰 සිංහල",
-    "ta": "🇮🇳 தமிழ்",
-    "hi": "🇮🇳 हिन्दी",
+    "zh": "🇨🇳 简体中文",
     "ms": "🇲🇾 Bahasa Melayu",
     "tl": "🇵🇭 Filipino",
-    "ru": "🇷🇺 Русский"
+    "ru": "🇷🇺 Русский",
+    "mm": "🇲🇲 မြန်မာ"
 }
-
 
 class LangDict(dict):
     # dictionary with a fallback for missing keys
