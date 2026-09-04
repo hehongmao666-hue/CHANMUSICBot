@@ -66,7 +66,7 @@ class Downloader:
                 "quiet": True,
                 "no_warnings": True,
                 "cookiefile": cookie_path,
-                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "format": "bestaudio",  # 🆕 自动选择最佳可用格式
                 "format_sort": ["res", "codec"],
                 "noplaylist": True,
                 "socket_timeout": 20,
@@ -201,10 +201,10 @@ class Downloader:
                     "extractor_retries": 10,
                     "sleep_interval_requests": 5,
                     "cookiefile": cookie_path,
-                    "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                    "format": "bestaudio",  # 🆕 自动选择最佳可用格式
                     "format_sort": ["res", "codec"],
                     "postprocessor_args": ["-c", "-movflags", "+faststart"],
-                    # 🆕 强制使用移动端客户端，绕过 YouTube 限制
+                    # 强制使用移动端客户端，绕过 YouTube 限制
                     "extractor_args": {
                         "youtube": {
                             "player_client": ["android", "ios", "web"],
@@ -212,7 +212,7 @@ class Downloader:
                             "player_skip": ["js"],
                         }
                     },
-                    # 🆕 伪装成真实手机 User-Agent
+                    # 伪装成真实手机 User-Agent
                     "headers": {
                         "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
                     }
@@ -241,7 +241,7 @@ class Downloader:
                 else:
                     ydl_opts = {
                         **base_opts,
-                        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                        "format": "bestaudio",  # 🆕 自动选择最佳可用格式
                         "postprocessors": [],
                     }
 
