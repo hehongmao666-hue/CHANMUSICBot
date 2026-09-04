@@ -55,11 +55,12 @@ class Downloader:
 
         # Extract live stream URL
         if is_live:
-            cookie = self._cookies.get_cookies()
+            # 🆕 使用 OAuth 认证替代 Cookies
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                "cookiefile": cookie,
+                "username": "oauth",
+                "password": "",
                 "format": "bestaudio/best",
                 "noplaylist": True,
                 "socket_timeout": 20,
@@ -167,7 +168,7 @@ class Downloader:
 
             # **PERFORMANCE FIX**: Use semaphore to limit concurrent downloads
             async with self._download_semaphore:
-                cookie = self._cookies.get_cookies()
+                # 🆕 使用 OAuth 认证替代 Cookies
                 base_opts = {
                     "outtmpl": "downloads/%(id)s.%(ext)s",
                     "quiet": True,
@@ -185,6 +186,8 @@ class Downloader:
                     "fragment_retries": 2,
                     "extractor_retries": 5,
                     "sleep_interval_requests": 1,
+                    "username": "oauth",      # 🆕 OAuth 认证
+                    "password": "",            # 🆕 留空
                 }
 
                 if video:
@@ -214,11 +217,7 @@ class Downloader:
                         "postprocessors": [],
                     }
 
-                ydl_opts_cookie = {
-                    **ydl_opts,
-                    "cookiefile": cookie,
-                }
-
+                # 🆕 不再需要 cookiefile，直接使用 ydl_opts
                 def _download(ydl_runtime_opts):
                     ydl_instance = None
                     try:
@@ -241,7 +240,7 @@ class Downloader:
                                 "❌ Video not available: May be region-blocked or private.")
                         elif "age" in error_msg.lower():
                             logger.error(
-                                "❌ Age-restricted video: Cookies required.")
+                                "❌ Age-restricted video: OAuth required.")
                         else:
                             logger.error("❌ YouTube extraction failed: %s", ex)
                         return None
@@ -273,4 +272,4 @@ class Downloader:
                             except Exception:
                                 pass
 
-                return await asyncio.to_thread(_download, ydl_opts_cookie)
+                return await asyncio.to_thread(_download, ydl_opts)
