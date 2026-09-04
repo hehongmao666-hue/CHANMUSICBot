@@ -12,6 +12,7 @@
 import re
 import glob
 import time
+import os  # 🆕 导入 os 模块
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -53,14 +54,18 @@ class Downloader:
 
         url = "https://www.youtube.com/watch?v=" + video_id
 
+        # 🆕 获取 cookies.txt 的绝对路径
+        cookie_path = os.path.join(os.getcwd(), "cookies.txt")
+        
+        # 添加日志，确认路径是否正确
+        logger.info(f"🍪 Looking for cookies at: {cookie_path}")
+
         # Extract live stream URL
         if is_live:
-            # 🆕 使用 OAuth 认证替代 Cookies
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                "username": "oauth",
-                "password": "",
+                "cookiefile": cookie_path,  # 🆕 使用绝对路径
                 "format": "bestaudio/best",
                 "noplaylist": True,
                 "socket_timeout": 20,
@@ -168,7 +173,6 @@ class Downloader:
 
             # **PERFORMANCE FIX**: Use semaphore to limit concurrent downloads
             async with self._download_semaphore:
-                # 🆕 使用 OAuth 认证替代 Cookies
                 base_opts = {
                     "outtmpl": "downloads/%(id)s.%(ext)s",
                     "quiet": True,
@@ -186,8 +190,7 @@ class Downloader:
                     "fragment_retries": 2,
                     "extractor_retries": 5,
                     "sleep_interval_requests": 1,
-                    "username": "oauth",      # 🆕 OAuth 认证
-                    "password": "",            # 🆕 留空
+                    "cookiefile": cookie_path,  # 🆕 使用绝对路径
                 }
 
                 if video:
@@ -217,7 +220,6 @@ class Downloader:
                         "postprocessors": [],
                     }
 
-                # 🆕 不再需要 cookiefile，直接使用 ydl_opts
                 def _download(ydl_runtime_opts):
                     ydl_instance = None
                     try:
@@ -240,7 +242,7 @@ class Downloader:
                                 "❌ Video not available: May be region-blocked or private.")
                         elif "age" in error_msg.lower():
                             logger.error(
-                                "❌ Age-restricted video: OAuth required.")
+                                "❌ Age-restricted video: Cookies required.")
                         else:
                             logger.error("❌ YouTube extraction failed: %s", ex)
                         return None
