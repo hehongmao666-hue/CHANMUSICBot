@@ -12,7 +12,6 @@
 import re
 import glob
 import time
-import os  # 🆕 添加 os 模块
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -54,16 +53,13 @@ class Downloader:
 
         url = "https://www.youtube.com/watch?v=" + video_id
 
-        # 🆕 获取 cookies.txt 的绝对路径
-        cookie_path = os.path.join(os.getcwd(), "cookies.txt")
-        logger.info(f"🍪 Using cookies from: {cookie_path}")
-
         # Extract live stream URL
         if is_live:
+            cookie = self._cookies.get_cookies()
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                "cookiefile": cookie_path,  # 🆕 直接使用本地文件
+                "cookiefile": cookie,
                 "format": "bestaudio/best",
                 "noplaylist": True,
                 "socket_timeout": 20,
@@ -171,6 +167,7 @@ class Downloader:
 
             # **PERFORMANCE FIX**: Use semaphore to limit concurrent downloads
             async with self._download_semaphore:
+                cookie = self._cookies.get_cookies()
                 base_opts = {
                     "outtmpl": "downloads/%(id)s.%(ext)s",
                     "quiet": True,
@@ -188,7 +185,6 @@ class Downloader:
                     "fragment_retries": 2,
                     "extractor_retries": 5,
                     "sleep_interval_requests": 1,
-                    "cookiefile": cookie_path,  # 🆕 直接使用本地文件
                 }
 
                 if video:
@@ -217,6 +213,11 @@ class Downloader:
                         "format": "bestaudio/best",
                         "postprocessors": [],
                     }
+
+                ydl_opts_cookie = {
+                    **ydl_opts,
+                    "cookiefile": cookie,
+                }
 
                 def _download(ydl_runtime_opts):
                     ydl_instance = None
@@ -272,4 +273,4 @@ class Downloader:
                             except Exception:
                                 pass
 
-                return await asyncio.to_thread(_download, ydl_opts)
+                return await asyncio.to_thread(_download, ydl_opts_cookie)
