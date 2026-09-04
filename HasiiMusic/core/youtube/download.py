@@ -72,6 +72,15 @@ class Downloader:
                 "socket_timeout": 20,
                 "extractor_retries": 5,
                 "sleep_interval_requests": 1,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android", "ios", "web"],
+                        "skip": ["hls", "dash"],
+                    }
+                },
+                "headers": {
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
+                }
             }
 
             def _extract_url():
@@ -185,19 +194,28 @@ class Downloader:
                     "continuedl": True,
                     "noprogress": True,
                     "concurrent_fragment_downloads": 4,
-                    "http_chunk_size": 524288,  # 512KB chunks
+                    "http_chunk_size": 524288,
                     "socket_timeout": 30,
-                    "retries": 2,
-                    "fragment_retries": 2,
-                    "extractor_retries": 5,
-                    "sleep_interval_requests": 1,
+                    "retries": 3,
+                    "fragment_retries": 3,
+                    "extractor_retries": 10,
+                    "sleep_interval_requests": 5,
                     "cookiefile": cookie_path,
-                    # 🆕 改进格式选择：优先 m4a，然后 webm，最后任意最佳音频
                     "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-                    # 🆕 添加格式排序
                     "format_sort": ["res", "codec"],
-                    # 🆕 添加后处理参数，优化播放兼容性
                     "postprocessor_args": ["-c", "-movflags", "+faststart"],
+                    # 🆕 强制使用移动端客户端，绕过 YouTube 限制
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["android", "ios", "web"],
+                            "skip": ["hls", "dash"],
+                            "player_skip": ["js"],
+                        }
+                    },
+                    # 🆕 伪装成真实手机 User-Agent
+                    "headers": {
+                        "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
+                    }
                 }
 
                 if video:
