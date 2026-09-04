@@ -12,7 +12,7 @@
 import re
 import glob
 import time
-import os
+import os  # 🆕 添加 os 模块
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -54,33 +54,21 @@ class Downloader:
 
         url = "https://www.youtube.com/watch?v=" + video_id
 
-        # 获取 cookies.txt 的绝对路径
+        # 🆕 获取 cookies.txt 的绝对路径
         cookie_path = os.path.join(os.getcwd(), "cookies.txt")
-        
-        # 添加日志，确认路径是否正确
-        logger.info(f"🍪 Looking for cookies at: {cookie_path}")
+        logger.info(f"🍪 Using cookies from: {cookie_path}")
 
         # Extract live stream URL
         if is_live:
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                "cookiefile": cookie_path,
-                "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/worstaudio",
-                "format_sort": ["res", "codec"],
+                "cookiefile": cookie_path,  # 🆕 直接使用本地文件
+                "format": "bestaudio/best",
                 "noplaylist": True,
                 "socket_timeout": 20,
                 "extractor_retries": 5,
                 "sleep_interval_requests": 1,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["android", "ios", "web"],
-                        "skip": ["hls", "dash"],
-                    }
-                },
-                "headers": {
-                    "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
-                }
             }
 
             def _extract_url():
@@ -194,27 +182,13 @@ class Downloader:
                     "continuedl": True,
                     "noprogress": True,
                     "concurrent_fragment_downloads": 4,
-                    "http_chunk_size": 524288,
+                    "http_chunk_size": 524288,  # 512KB chunks
                     "socket_timeout": 30,
-                    "retries": 3,
-                    "fragment_retries": 3,
-                    "extractor_retries": 10,
-                    "sleep_interval_requests": 5,
-                    "cookiefile": cookie_path,
-                    # 🔑 关键修改：使用更通用的格式，opus/aac，最后兜底 worstaudio
-                    "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/worstaudio",
-                    "format_sort": ["res", "codec"],
-                    "postprocessor_args": ["-c", "-movflags", "+faststart"],
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": ["android", "ios", "web"],
-                            "skip": ["hls", "dash"],
-                            "player_skip": ["js"],
-                        }
-                    },
-                    "headers": {
-                        "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36"
-                    }
+                    "retries": 2,
+                    "fragment_retries": 2,
+                    "extractor_retries": 5,
+                    "sleep_interval_requests": 1,
+                    "cookiefile": cookie_path,  # 🆕 直接使用本地文件
                 }
 
                 if video:
@@ -240,7 +214,7 @@ class Downloader:
                 else:
                     ydl_opts = {
                         **base_opts,
-                        "format": "bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/worstaudio",
+                        "format": "bestaudio/best",
                         "postprocessors": [],
                     }
 
