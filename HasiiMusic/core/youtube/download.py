@@ -12,7 +12,7 @@
 import re
 import glob
 import time
-import os  # 🆕 导入 os 模块
+import os
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -54,7 +54,7 @@ class Downloader:
 
         url = "https://www.youtube.com/watch?v=" + video_id
 
-        # 🆕 获取 cookies.txt 的绝对路径
+        # 获取 cookies.txt 的绝对路径
         cookie_path = os.path.join(os.getcwd(), "cookies.txt")
         
         # 添加日志，确认路径是否正确
@@ -65,8 +65,9 @@ class Downloader:
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
-                "cookiefile": cookie_path,  # 🆕 使用绝对路径
-                "format": "bestaudio/best",
+                "cookiefile": cookie_path,
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "format_sort": ["res", "codec"],
                 "noplaylist": True,
                 "socket_timeout": 20,
                 "extractor_retries": 5,
@@ -190,7 +191,13 @@ class Downloader:
                     "fragment_retries": 2,
                     "extractor_retries": 5,
                     "sleep_interval_requests": 1,
-                    "cookiefile": cookie_path,  # 🆕 使用绝对路径
+                    "cookiefile": cookie_path,
+                    # 🆕 改进格式选择：优先 m4a，然后 webm，最后任意最佳音频
+                    "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                    # 🆕 添加格式排序
+                    "format_sort": ["res", "codec"],
+                    # 🆕 添加后处理参数，优化播放兼容性
+                    "postprocessor_args": ["-c", "-movflags", "+faststart"],
                 }
 
                 if video:
@@ -216,7 +223,7 @@ class Downloader:
                 else:
                     ydl_opts = {
                         **base_opts,
-                        "format": "bestaudio/best",
+                        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
                         "postprocessors": [],
                     }
 
