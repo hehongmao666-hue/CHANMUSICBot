@@ -188,6 +188,7 @@ class Downloader:
                     "fragment_retries": 2,
                     "extractor_retries": 5,
                     "sleep_interval_requests": 1,
+                    "js_runtimes": {"node": {}},
                     "cookiefile": cookie_path,  # 🆕 直接使用本地文件
                 }
 
