@@ -176,7 +176,19 @@ class MongoDB:
 
     # ASSISTANT METHODS
     async def set_assistant(self, chat_id: int) -> int:
-        num = randint(1, len(userbot.clients))
+        from HasiiMusic import tune
+
+        # The assigned assistant is ultimately a PyTgCalls client from
+        # `tune.clients`, so use the same active-client pool for assignment.
+        # This also prevents randint(1, 0) when no assistant is available.
+        available = len(tune.clients)
+        if available <= 0:
+            raise RuntimeError(
+                "No active assistant clients are available. "
+                "Check SESSION1/SESSION2/SESSION3 and assistant startup logs."
+            )
+
+        num = randint(1, available)
         await self.assistantdb.update_one(
             {"_id": chat_id},
             {"$set": {"num": num}},
@@ -193,9 +205,16 @@ class MongoDB:
             num = doc["num"] if doc else await self.set_assistant(chat_id)
             self.assistant[chat_id] = num
 
-        # check if the assigned assistant still exists (e.g., assistant was removed)
-        if self.assistant[chat_id] > len(userbot.clients):
-            # assign a valid assistant instead
+        # Check the actual PyTgCalls pool. The old code checked
+        # `userbot.clients` but returned from `tune.clients`, which could leave
+        # the two counts inconsistent.
+        if not tune.clients:
+            raise RuntimeError(
+                "No active PyTgCalls assistant clients are available. "
+                "Check assistant startup and PyTgCalls initialization."
+            )
+
+        if self.assistant[chat_id] > len(tune.clients):
             num = await self.set_assistant(chat_id)
             self.assistant[chat_id] = num
 

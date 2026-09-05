@@ -61,6 +61,9 @@ class Userbot(Client):
         client = clients[num]
         try:
             await client.start()
+            # Force-refresh the authenticated user. This avoids relying on a
+            # partially populated `client.me` during startup.
+            me = await client.get_me()
         except Exception as e:
             logger.error(f"❌ Assistant {num} failed to start: {e}")
             logger.error(f"   This could be due to:")
@@ -76,16 +79,21 @@ class Userbot(Client):
                 f"⚠️ Assistant {num} couldn't send message to logger: {e}")
             # Continue anyway - this is not critical
 
-        client.id = client.me.id if hasattr(
-            client, 'me') and client.me else None
-        client.name = client.me.first_name if hasattr(
-            client, 'me') and client.me else f"Assistant{num}"
-        client.username = client.me.username if hasattr(
-            client, 'me') and client.me else None
-        client.mention = client.me.mention if hasattr(
-            client, 'me') and client.me else client.name
-        self.clients.append(client)
-        logger.info(f"👤 Assistant {num} started as @{client.username}")
+        # Use the freshly fetched account object instead of assuming `client.me`
+        # is already populated. Keep the client in the active list before the
+        # success log so downstream startup code sees a consistent state.
+        client.id = me.id
+        client.name = me.first_name or f"Assistant{num}"
+        client.username = me.username
+        client.mention = me.mention
+
+        if client not in self.clients:
+            self.clients.append(client)
+
+        logger.info(
+            f"👤 Assistant {num} started as @{client.username or 'no_username'} "
+            f"(active assistants: {len(self.clients)})"
+        )
 
     async def boot(self):
 
