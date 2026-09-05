@@ -1,16 +1,15 @@
 # ==============================================================================
 # download.py - YouTube Downloader Engine
 # ==============================================================================
-# This file orchestrates the downloading of audio and video from YouTube.
-#
 # Features:
-# - Limits concurrency using semaphores
-# - Prevents duplicate concurrent downloads using locks
-# - Executes yt-dlp to download streams and files
-# - Resolves Spotify fallbacks lazily
-# - Uses cookies.txt for YouTube authentication
-# - Uses Node.js JS runtime for YouTube challenge solving
-# - Optimized for low-memory environments such as Render 512MB
+# - YouTube audio/video downloading
+# - Spotify/search lazy resolution
+# - Per-video download locks
+# - Download concurrency control
+# - Low-memory optimization for Render
+# - Render Secret File cookie support
+# - Local cookies.txt fallback
+# - Automatic YouTube cookie failure detection
 # ==============================================================================
 
 import re
@@ -37,22 +36,11 @@ class Downloader:
         # ==========================================================================
         # MEMORY OPTIMIZATION
         # ==========================================================================
-        # Limit simultaneous yt-dlp downloads.
-        #
-        # Previous:
-        #     Semaphore(5)
-        #
-        # New:
-        #     Semaphore(2)
-        #
-        # This significantly reduces RAM usage when multiple users request
-        # songs/videos at the same time.
-        # ==========================================================================
 
+        # Maximum 2 simultaneous yt-dlp downloads.
         self._download_semaphore = asyncio.Semaphore(2)
 
-        # Prevent the same YouTube video from being downloaded multiple times
-        # simultaneously.
+        # Prevent duplicate downloads of the same video.
         self._download_locks: dict = {}
 
         self._max_video_height = getattr(
@@ -62,18 +50,185 @@ class Downloader:
         )
 
     # ==========================================================================
+    # COOKIE PATH
+    # ==========================================================================
+
+    def _get_cookie_path(self) -> Optional[str]:
+        """
+        Get YouTube cookies path.
+
+        Priority:
+        1. Render Secret File:
+           /etc/secrets/cookies.txt
+
+        2. Local/project file:
+           ./cookies.txt
+
+        This allows:
+        - Production -> Render Secret File
+        - Local development -> cookies.txt
+        """
+
+        # ----------------------------------------------------------------------
+        # Render Secret File
+        # ----------------------------------------------------------------------
+
+        secret_cookie = "/etc/secrets/cookies.txt"
+
+        if os.path.isfile(secret_cookie):
+
+            logger.info(
+                "🍪 Using YouTube cookies from Render Secret File"
+            )
+
+            return secret_cookie
+
+        # ----------------------------------------------------------------------
+        # Local fallback
+        # ----------------------------------------------------------------------
+
+        local_cookie = os.path.abspath(
+            "cookies.txt"
+        )
+
+        if os.path.isfile(local_cookie):
+
+            logger.info(
+                f"🍪 Using local YouTube cookies: {local_cookie}"
+            )
+
+            return local_cookie
+
+        # ----------------------------------------------------------------------
+        # No cookie found
+        # ----------------------------------------------------------------------
+
+        logger.warning(
+            "⚠️ YouTube cookies.txt was not found. "
+            "YouTube playback may fail if authentication is required."
+        )
+
+        return None
+
+    # ==========================================================================
+    # COOKIE OPTIONS
+    # ==========================================================================
+
+    def _get_cookie_options(self) -> dict:
+        """
+        Return yt-dlp cookie options only when a valid cookie file exists.
+        """
+
+        cookie_path = self._get_cookie_path()
+
+        if not cookie_path:
+            return {}
+
+        return {
+            "cookiefile": cookie_path
+        }
+
+    # ==========================================================================
+    # YOUTUBE COOKIE FAILURE DETECTION
+    # ==========================================================================
+
+    def _is_cookie_error(self, error_message: str) -> bool:
+        """
+        Detect common YouTube authentication / anti-bot errors.
+
+        This does NOT automatically refresh cookies.
+        It only identifies when the current cookies are likely invalid
+        or no longer sufficient.
+        """
+
+        if not error_message:
+            return False
+
+        error_lower = error_message.lower()
+
+        cookie_error_keywords = (
+
+            # Authentication
+            "login required",
+            "sign in to confirm",
+            "sign in to verify",
+
+            # YouTube anti-bot
+            "not a bot",
+            "confirm you're not a bot",
+            "confirm you are not a bot",
+
+            # Cookie invalidation
+            "cookies are no longer valid",
+            "cookie has expired",
+            "cookies have expired",
+            "authentication required",
+
+            # Account-related
+            "account cookies",
+            "logged in",
+
+            # Some YouTube extraction failures
+            "requested video is not available"
+        )
+
+        return any(
+            keyword in error_lower
+            for keyword in cookie_error_keywords
+        )
+
+    # ==========================================================================
+    # COOKIE FAILURE LOG
+    # ==========================================================================
+
+    def _log_cookie_failure(self, error_message: str) -> None:
+        """
+        Print a clear message to Render logs when cookies appear invalid.
+        """
+
+        logger.error(
+            "🍪 =================================================="
+        )
+
+        logger.error(
+            "🍪 YouTube Cookie may be expired or invalid."
+        )
+
+        logger.error(
+            "🍪 Please update the Render Secret File:"
+        )
+
+        logger.error(
+            "🍪 /etc/secrets/cookies.txt"
+        )
+
+        logger.error(
+            "🍪 Do NOT put cookies.txt into Git."
+        )
+
+        logger.error(
+            "🍪 =================================================="
+        )
+
+    # ==========================================================================
     # PER VIDEO LOCK
     # ==========================================================================
 
-    def _get_download_lock(self, video_id: str) -> asyncio.Lock:
+    def _get_download_lock(
+        self,
+        video_id: str
+    ) -> asyncio.Lock:
 
         if video_id not in self._download_locks:
-            self._download_locks[video_id] = asyncio.Lock()
+
+            self._download_locks[video_id] = (
+                asyncio.Lock()
+            )
 
         return self._download_locks[video_id]
 
     # ==========================================================================
-    # DOWNLOAD
+    # MAIN DOWNLOAD
     # ==========================================================================
 
     async def download(
@@ -84,17 +239,13 @@ class Downloader:
     ) -> Optional[str]:
 
         # ==========================================================================
-        # LAZY RESOLUTION
-        # ==========================================================================
-        # Resolve:
-        # - Search query
-        # - Spotify URL
-        # - Spotify track
-        #
-        # into a YouTube video ID.
+        # LAZY RESOLVE
         # ==========================================================================
 
-        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        if not re.fullmatch(
+            r"[A-Za-z0-9_-]{11}",
+            video_id
+        ):
 
             try:
 
@@ -150,18 +301,10 @@ class Downloader:
         )
 
         # ==========================================================================
-        # COOKIES
-        # ==========================================================================
-        # Use absolute path so Render can reliably locate cookies.txt.
+        # COOKIE OPTIONS
         # ==========================================================================
 
-        cookie_path = os.path.abspath(
-            "cookies.txt"
-        )
-
-        logger.info(
-            f"🍪 Using cookies from: {cookie_path}"
-        )
+        cookie_opts = self._get_cookie_options()
 
         # ==========================================================================
         # LIVE STREAM
@@ -175,8 +318,6 @@ class Downloader:
 
                 "no_warnings": True,
 
-                "cookiefile": cookie_path,
-
                 "format": "bestaudio/best",
 
                 "noplaylist": True,
@@ -187,11 +328,12 @@ class Downloader:
 
                 "sleep_interval_requests": 1,
 
-                # IMPORTANT:
-                # Node.js is required by current YouTube extraction.
+                # Current YouTube JS challenge support.
                 "js_runtimes": {
                     "node": {}
                 },
+
+                **cookie_opts,
             }
 
             def _extract_url():
@@ -210,13 +352,13 @@ class Downloader:
                         if not info:
                             return None
 
-                        # Direct URL
-                        direct = info.get("url")
+                        direct = info.get(
+                            "url"
+                        )
 
                         if direct:
                             return direct
 
-                        # Search formats
                         for fmt in info.get(
                             "formats",
                             []
@@ -237,17 +379,25 @@ class Downloader:
 
                         error_msg = str(ex)
 
-                        if "not available" in error_msg.lower():
+                        if self._is_cookie_error(
+                            error_msg
+                        ):
+
+                            self._log_cookie_failure(
+                                error_msg
+                            )
+
+                        elif "not available" in error_msg.lower():
 
                             logger.error(
-                                "Video format not available "
+                                "❌ Video format not available "
                                 "or region-blocked."
                             )
 
                         else:
 
                             logger.error(
-                                "Live stream URL extraction failed: %s",
+                                "❌ Live stream URL extraction failed: %s",
                                 ex
                             )
 
@@ -256,7 +406,7 @@ class Downloader:
                     except Exception as ex:
 
                         logger.error(
-                            "Unexpected error during "
+                            "❌ Unexpected error during "
                             "live stream extraction: %s",
                             ex
                         )
@@ -275,7 +425,7 @@ class Downloader:
             except asyncio.TimeoutError:
 
                 logger.error(
-                    "Live stream URL extraction timed out "
+                    "❌ Live stream URL extraction timed out "
                     "for %s",
                     video_id
                 )
@@ -285,24 +435,14 @@ class Downloader:
             return stream_url
 
         # ==========================================================================
-        # DOWNLOAD FILE NAME
+        # FILE CACHE
         # ==========================================================================
 
         filename_pattern = (
             f"downloads/{video_id}"
         )
 
-        # ==========================================================================
-        # CACHE CHECK
-        # ==========================================================================
-
         def _check_cache() -> Optional[str]:
-
-            """
-            Check downloads/ for a valid existing file.
-
-            Invalid small files are deleted automatically.
-            """
 
             existing_files = [
 
@@ -322,7 +462,7 @@ class Downloader:
             ]
 
             # ==================================================================
-            # VIDEO MODE
+            # VIDEO
             # ==================================================================
 
             if video:
@@ -350,7 +490,7 @@ class Downloader:
                     self._storage.delete_stub(f)
 
             # ==================================================================
-            # AUDIO MODE
+            # AUDIO
             # ==================================================================
 
             else:
@@ -382,12 +522,7 @@ class Downloader:
                     self._storage.delete_stub(f)
 
                 # --------------------------------------------------------------
-                # MP4/MKV/MOV FALLBACK
-                # --------------------------------------------------------------
-                # yt-dlp can sometimes return a container such as MP4 even when
-                # audio mode was requested.
-                #
-                # StorageManager also supports this fallback.
+                # AUDIO FALLBACK
                 # --------------------------------------------------------------
 
                 container_fallbacks = [
@@ -415,7 +550,7 @@ class Downloader:
             return None
 
         # ==========================================================================
-        # FAST CACHE PATH
+        # FAST CACHE CHECK
         # ==========================================================================
 
         cached = _check_cache()
@@ -429,7 +564,7 @@ class Downloader:
             return cached
 
         # ==========================================================================
-        # CREATE DOWNLOAD DIRECTORY
+        # DOWNLOAD DIRECTORY
         # ==========================================================================
 
         downloads_dir = Path(
@@ -461,10 +596,9 @@ class Downloader:
         # PER VIDEO LOCK
         # ==========================================================================
 
-        async with self._get_download_lock(video_id):
-
-            # Check cache again after acquiring lock.
-            # Another request may have completed the same download.
+        async with self._get_download_lock(
+            video_id
+        ):
 
             cached = _check_cache()
 
@@ -476,21 +610,15 @@ class Downloader:
 
                 return cached
 
-            # ======================================================================
-            # DOWNLOAD SEMAPHORE
-            # ======================================================================
-            # MEMORY OPTIMIZATION:
-            #
-            # Maximum simultaneous downloads = 2
-            #
-            # This is one of the most important changes for Render 512MB.
-            # ======================================================================
+            # ==================================================================
+            # MEMORY-LIMITED DOWNLOAD
+            # ==================================================================
 
             async with self._download_semaphore:
 
-                # ==================================================================
+                # ==============================================================
                 # BASE YT-DLP OPTIONS
-                # ==================================================================
+                # ==============================================================
 
                 base_opts = {
 
@@ -521,33 +649,19 @@ class Downloader:
                     "noprogress":
                         True,
 
-                    # ==================================================================
-                    # MEMORY / NETWORK OPTIMIZATION
-                    # ==================================================================
-                    #
-                    # Previous:
-                    #     concurrent_fragment_downloads = 4
-                    #
-                    # New:
-                    #     concurrent_fragment_downloads = 1
-                    #
-                    # This reduces simultaneous fragment processing and memory usage.
-                    # ==================================================================
+                    # ==========================================================
+                    # MEMORY OPTIMIZATION
+                    # ==========================================================
 
                     "concurrent_fragment_downloads":
                         1,
 
-                    # Previous:
-                    #     524288 (512KB)
-                    #
-                    # New:
-                    #     262144 (256KB)
-                    #
-                    # Smaller chunks reduce peak memory pressure.
-                    # ==================================================================
-
                     "http_chunk_size":
                         262144,
+
+                    # ==========================================================
+                    # NETWORK
+                    # ==========================================================
 
                     "socket_timeout":
                         30,
@@ -564,25 +678,24 @@ class Downloader:
                     "sleep_interval_requests":
                         1,
 
-                    # ==================================================================
+                    # ==========================================================
                     # YOUTUBE JS CHALLENGE
-                    # ==================================================================
+                    # ==========================================================
 
                     "js_runtimes": {
                         "node": {}
                     },
 
-                    # ==================================================================
-                    # YOUTUBE COOKIES
-                    # ==================================================================
+                    # ==========================================================
+                    # COOKIES
+                    # ==========================================================
 
-                    "cookiefile":
-                        cookie_path,
+                    **cookie_opts,
                 }
 
-                # ======================================================================
-                # VIDEO OPTIONS
-                # ======================================================================
+                # ==================================================================
+                # VIDEO MODE
+                # ==================================================================
 
                 if video:
 
@@ -634,9 +747,9 @@ class Downloader:
                         ],
                     }
 
-                # ======================================================================
-                # AUDIO OPTIONS
-                # ======================================================================
+                # ==================================================================
+                # AUDIO MODE
+                # ==================================================================
 
                 else:
 
@@ -651,9 +764,9 @@ class Downloader:
                             [],
                     }
 
-                # ======================================================================
-                # ACTUAL DOWNLOAD
-                # ======================================================================
+                # ==================================================================
+                # DOWNLOAD FUNCTION
+                # ==================================================================
 
                 def _download(
                     ydl_runtime_opts
@@ -663,8 +776,10 @@ class Downloader:
 
                     try:
 
-                        ydl_instance = yt_dlp.YoutubeDL(
-                            ydl_runtime_opts
+                        ydl_instance = (
+                            yt_dlp.YoutubeDL(
+                                ydl_runtime_opts
+                            )
                         )
 
                         info = ydl_instance.extract_info(
@@ -681,10 +796,13 @@ class Downloader:
 
                             return None
 
-                        # Small delay to make sure filesystem writes are complete.
+                        # Allow filesystem writes to finish.
                         time.sleep(0.5)
 
-                        # Locate downloaded file.
+                        # ======================================================
+                        # LOCATE FILE
+                        # ======================================================
+
                         located = (
                             self._storage.locate_download_file(
                                 video_id,
@@ -700,12 +818,9 @@ class Downloader:
 
                             return located
 
-                        # ------------------------------------------------------------------
-                        # FALLBACK CHECK
-                        # ------------------------------------------------------------------
-                        # This protects against cases where StorageManager cannot
-                        # immediately detect the output file.
-                        # ------------------------------------------------------------------
+                        # ======================================================
+                        # FALLBACK CACHE CHECK
+                        # ======================================================
 
                         fallback = _check_cache()
 
@@ -725,26 +840,34 @@ class Downloader:
 
                         return None
 
-                    # ==================================================================
+                    # ==========================================================
                     # EXTRACTOR ERROR
-                    # ==================================================================
+                    # ==========================================================
 
                     except yt_dlp.utils.ExtractorError as ex:
 
                         error_msg = str(ex)
 
-                        if "not available" in error_msg.lower():
+                        if self._is_cookie_error(
+                            error_msg
+                        ):
 
-                            logger.error(
-                                "❌ Video not available: "
-                                "May be region-blocked or private."
+                            self._log_cookie_failure(
+                                error_msg
                             )
 
                         elif "age" in error_msg.lower():
 
                             logger.error(
                                 "❌ Age-restricted video: "
-                                "Cookies required."
+                                "Cookies may be required."
+                            )
+
+                        elif "not available" in error_msg.lower():
+
+                            logger.error(
+                                "❌ Video not available: "
+                                "May be region-blocked or private."
                             )
 
                         else:
@@ -756,13 +879,29 @@ class Downloader:
 
                         return None
 
-                    # ==================================================================
+                    # ==========================================================
                     # DOWNLOAD ERROR
-                    # ==================================================================
+                    # ==========================================================
 
                     except yt_dlp.utils.DownloadError as ex:
 
                         error_msg = str(ex)
+
+                        # ------------------------------------------------------
+                        # Detect cookie failure
+                        # ------------------------------------------------------
+
+                        if self._is_cookie_error(
+                            error_msg
+                        ):
+
+                            self._log_cookie_failure(
+                                error_msg
+                            )
+
+                        # ------------------------------------------------------
+                        # Try to recover downloaded file
+                        # ------------------------------------------------------
 
                         recovered = (
                             self._storage.locate_download_file(
@@ -771,9 +910,9 @@ class Downloader:
                             )
                         )
 
-                        # ------------------------------------------------------------------
-                        # RENAME ERROR
-                        # ------------------------------------------------------------------
+                        # ------------------------------------------------------
+                        # Rename error
+                        # ------------------------------------------------------
 
                         if (
                             "unable to rename file"
@@ -789,15 +928,15 @@ class Downloader:
 
                             return recovered
 
-                        # ------------------------------------------------------------------
-                        # HTTP RANGE ERROR
-                        # ------------------------------------------------------------------
+                        # ------------------------------------------------------
+                        # HTTP 416
+                        # ------------------------------------------------------
 
                         if (
                             "416" in error_msg
                             or
-                            "Requested range not satisfiable"
-                            in error_msg
+                            "requested range not satisfiable"
+                            in error_msg.lower()
                         ):
 
                             logger.warning(
@@ -822,9 +961,9 @@ class Downloader:
 
                         return None
 
-                    # ==================================================================
+                    # ==========================================================
                     # UNEXPECTED ERROR
-                    # ==================================================================
+                    # ==========================================================
 
                     except Exception as ex:
 
@@ -835,9 +974,9 @@ class Downloader:
 
                         return None
 
-                    # ==================================================================
+                    # ==========================================================
                     # CLEANUP
-                    # ==================================================================
+                    # ==========================================================
 
                     finally:
 
@@ -851,9 +990,9 @@ class Downloader:
 
                                 pass
 
-                # ======================================================================
-                # RUN DOWNLOAD IN THREAD
-                # ======================================================================
+                # ==================================================================
+                # RUN IN THREAD
+                # ==================================================================
 
                 return await asyncio.to_thread(
                     _download,
