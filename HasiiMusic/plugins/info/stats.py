@@ -50,14 +50,16 @@ async def _stats(_, m: types.Message):
     
     # Add system stats for sudo users only
     if is_sudo:
-        pid = os.getpid()
-        cpu_percent = psutil.cpu_percent(interval=0.5)
-        cpu_count = psutil.cpu_count()
-        
-        mem = psutil.virtual_memory()
-        used_mem = round(mem.used / (1024 ** 3), 2)
-        total_mem = round(mem.total / (1024 ** 3), 2)
-        
+        # IMPORTANT: report the bot PROCESS usage, not the host/container
+        # total memory. psutil.virtual_memory() can be misleading on Render.
+        process = psutil.Process(os.getpid())
+        process_mem = process.memory_info().rss
+        used_mem = round(process_mem / (1024 ** 3), 2)
+
+        # CPU usage for this bot process, not the whole host.
+        process_cpu = process.cpu_percent(interval=0.5)
+        cpu_count = psutil.cpu_count() or 1
+
         disk = psutil.disk_usage("/")
         used_disk = round(disk.used / (1024 ** 3), 2)
         total_disk = round(disk.total / (1024 ** 3), 2)
@@ -66,7 +68,7 @@ async def _stats(_, m: types.Message):
             len(all_modules),
             platform.system(),
             f"{used_mem}GB | {total_mem}GB",
-            f"{cpu_percent}% ({cpu_count} cores)",
+            f"{process_cpu}% ({cpu_count} cores)",
             f"{used_disk}GB | {total_disk}GB",
             sys.version.split()[0],
             __version__,

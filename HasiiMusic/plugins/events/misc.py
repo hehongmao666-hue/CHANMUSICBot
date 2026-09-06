@@ -11,7 +11,7 @@ import time
 import pyrogram
 from pyrogram import enums, filters, types
 
-from HasiiMusic import tune, app, config, db, lang, logger, queue, tasks, userbot, yt
+from HasiiMusic import tune, app, config, db, lang, logger, queue, tasks, userbot, yt, preload
 from HasiiMusic.helpers import buttons
 
 
@@ -49,15 +49,6 @@ async def track_time():
 async def update_timer(length=10):
     chat_tasks = {}  # Track individual chat update tasks
 
-    async def _preload_next(chat_id, next_media):
-        try:
-            next_media.file_path = await yt.download(
-                next_media.id,
-                video=getattr(next_media, "video", False),
-            )
-        except Exception as e:
-            print(f"Preload error for chat {chat_id}: {e}")
-
     async def update_chat_timer(chat_id):
         while True:
             try:
@@ -90,11 +81,10 @@ async def update_timer(length=10):
                 filled = int(round(bar_length * percentage / 100))
                 timer_bar = "—" * filled + "●" + "—" * (bar_length - filled)
 
-                # Pre-download next song if needed (don't block timer update)
+                # Use the central preload manager instead of creating a
+                # second independent yt-dlp task for the same next track.
                 if remaining <= 30:
-                    next = queue.get_next(chat_id, check=True)
-                    if next and not next.file_path:
-                        asyncio.create_task(_preload_next(chat_id, next))
+                    await preload.start_preload(chat_id, count=1)
 
                 if remaining < 10:
                     remove = True

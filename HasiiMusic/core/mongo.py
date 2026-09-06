@@ -146,6 +146,28 @@ class MongoDB:
         if chat_id not in self.admin_list or reload or cache_age > 900:  # 15 minutes
             self.admin_list[chat_id] = await reload_admins(chat_id)
             self.admin_cache_time[chat_id] = current_time
+
+        # Bound the in-memory admin cache. Without a cap, a long-running bot
+        # can retain one admin list per group forever.
+        if len(self.admin_list) > 300:
+            cutoff = current_time - 900
+            stale = [
+                cid for cid, cached_at in self.admin_cache_time.items()
+                if cached_at < cutoff and cid != chat_id
+            ]
+            for cid in stale:
+                self.admin_list.pop(cid, None)
+                self.admin_cache_time.pop(cid, None)
+
+            # If everything is still fresh, evict the oldest entries.
+            while len(self.admin_list) > 300:
+                oldest = min(
+                    self.admin_cache_time,
+                    key=self.admin_cache_time.get
+                )
+                self.admin_list.pop(oldest, None)
+                self.admin_cache_time.pop(oldest, None)
+
         return self.admin_list[chat_id]
 
     # AUTH METHODS

@@ -272,7 +272,7 @@ class CallPlayer:
 
                 try:
                     asyncio.create_task(
-                        preload.start_preload(chat_id, count=2))
+                        preload.start_preload(chat_id, count=1))
                 except Exception as e:
                     logger.debug(f"Error starting preload for {chat_id}: {e}")
         except FileNotFoundError:

@@ -232,7 +232,7 @@ async def play_hndlr(
             # ✨ NEW: Start preloading queued tracks in background
             try:
                 from HasiiMusic import preload
-                asyncio.create_task(preload.start_preload(chat_id, count=2))
+                asyncio.create_task(preload.start_preload(chat_id, count=1))
             except Exception:
                 # Non-critical, continue without preload
                 pass

@@ -5,8 +5,8 @@
 # to eliminate gaps between songs during playback.
 #
 # Features:
-# - Downloads next 2-3 tracks in background while current track plays
-# - Respects existing download semaphore limits (max 5 concurrent)
+# - Downloads the next track in background while current track plays
+# - Respects the downloader's memory-limited concurrency
 # - Automatically cancels preload tasks when queue changes
 # - Prevents duplicate downloads
 # - Smart prioritization (next track = highest priority)
@@ -30,7 +30,7 @@ class PreloadManager:
         # Track which items are currently being preloaded to prevent duplicates
         self._preloading: Dict[int, Set[str]] = {}  # {chat_id: set of track IDs}
     
-    async def start_preload(self, chat_id: int, count: int = 2) -> None:
+    async def start_preload(self, chat_id: int, count: int = 1) -> None:
         """
         Start preloading upcoming tracks for a chat.
         
@@ -40,6 +40,11 @@ class PreloadManager:
         """
         from HasiiMusic import queue, yt
         
+        # Only preload one next track. The downloader already limits active
+        # downloads; keeping the preload window at one avoids background
+        # memory/disk spikes as the number of groups grows.
+        count = 1
+
         # Get upcoming tracks from queue
         upcoming_tracks = queue.peek_next(chat_id, count)
         
@@ -114,8 +119,10 @@ class PreloadManager:
         
         finally:
             # Remove from preloading set
-            if chat_id in self._preloading and track.id in self._preloading[chat_id]:
-                self._preloading[chat_id].remove(track.id)
+            if chat_id in self._preloading:
+                self._preloading[chat_id].discard(track.id)
+                if not self._preloading[chat_id]:
+                    self._preloading.pop(chat_id, None)
     
     async def cancel_preload(self, chat_id: int) -> None:
         """
@@ -158,3 +165,5 @@ class PreloadManager:
         """
         if chat_id in self._preload_tasks:
             self._preload_tasks[chat_id].discard(task)
+            if not self._preload_tasks[chat_id]:
+                self._preload_tasks.pop(chat_id, None)
