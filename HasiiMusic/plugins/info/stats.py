@@ -48,6 +48,7 @@ def _get_container_memory():
 
     Uses cgroup v2 first, then cgroup v1 as fallback.
     """
+
     # ------------------------------------------------------------------
     # cgroup v2
     # ------------------------------------------------------------------
@@ -101,7 +102,10 @@ def _get_memory_stats():
         limit_gb
         percentage
     """
+
+    # ------------------------------------------------------------------
     # Python process RSS
+    # ------------------------------------------------------------------
     process = psutil.Process(os.getpid())
 
     try:
@@ -111,7 +115,9 @@ def _get_memory_stats():
 
     process_gb = process_rss / (1024 ** 3)
 
-    # Render/container memory
+    # ------------------------------------------------------------------
+    # Render / container memory
+    # ------------------------------------------------------------------
     container_gb, limit_gb = _get_container_memory()
 
     if container_gb is not None and limit_gb:
@@ -131,11 +137,17 @@ def _get_memory_stats():
 @lang.language()
 async def _stats(_, m: types.Message):
 
+    # ------------------------------------------------------------------
+    # Delete command message
+    # ------------------------------------------------------------------
     try:
         await m.delete()
     except Exception:
         pass
 
+    # ------------------------------------------------------------------
+    # Temporary stats message
+    # ------------------------------------------------------------------
     sent = await m.reply_photo(
         photo=config.PING_IMG,
         caption=m.lang["stats_fetching"],
@@ -143,6 +155,9 @@ async def _stats(_, m: types.Message):
 
     is_sudo = m.from_user.id in app.sudoers
 
+    # ------------------------------------------------------------------
+    # Basic statistics
+    # ------------------------------------------------------------------
     _utext = m.lang["stats_user"].format(
         app.name,
         len(userbot.clients),
@@ -167,12 +182,18 @@ async def _stats(_, m: types.Message):
             memory_percent,
         ) = _get_memory_stats()
 
+        # ------------------------------------------------------------------
+        # Main RAM line
+        # ------------------------------------------------------------------
         if container_mem is not None and memory_limit is not None:
+
             memory_line = (
                 f"{container_mem}GB | {memory_limit}GB "
                 f"({memory_percent}%)"
             )
+
         else:
+
             virtual_memory = psutil.virtual_memory()
 
             total_mem = round(
@@ -215,6 +236,7 @@ async def _stats(_, m: types.Message):
             )
 
         except Exception:
+
             used_disk = 0
             total_disk = 0
 
@@ -234,44 +256,55 @@ async def _stats(_, m: types.Message):
         )
 
         # ==============================================================
-        # EXTRA MEMORY DIAGNOSTICS
+        # MEMORY DIAGNOSTICS
         # ==============================================================
 
-        if container_mem is not None:
-
-            _utext += (
-                "\n\n"
-                "**ᴍᴇᴍᴏʀʏ ᴅɪᴀɢɴᴏꜱᴛɪᴄ:**"
-                "\n"
-                f"**ᴘʀᴏᴄᴇꜱꜱ ʀᴀᴍ:** {process_mem}GB"
-                "\n"
-                f"**ᴄᴏɴᴛᴀɪɴᴇʀ ʀᴀᴍ:** {container_mem}GB"
-                "\n"
-                f"**ʀᴀᴍ ʟɪᴍɪᴛ:** {memory_limit}GB"
-                "\n"
-                f"**ʀᴀᴍ ᴜsᴀɢᴇ:** {memory_percent}%"
-            )
+        if container_mem is not None and memory_limit is not None:
 
             # ----------------------------------------------------------
-            # Simple warning levels
+            # Memory status
             # ----------------------------------------------------------
 
             if memory_percent >= 85:
 
-                _utext += (
-                    "\n⚠️ **ʜɪɢʜ ᴍᴇᴍᴏʀʏ ᴜsᴀɢᴇ**"
+                memory_status = (
+                    "⚠️ ʜɪɢʜ ᴍᴇᴍᴏʀʏ ᴜꜱᴀɢᴇ"
                 )
 
             elif memory_percent >= 70:
 
-                _utext += (
-                    "\n⚠️ **ᴍᴇᴍᴏʀʏ ᴜsᴀɢᴇ ɪs ʀɪsɪɴɢ**"
+                memory_status = (
+                    "⚠️ ᴍᴇᴍᴏʀʏ ᴜꜱᴀɢᴇ ɪꜱ ʀɪꜱɪɴɢ"
                 )
 
             else:
 
-                _utext += (
-                    "\n✅ **ᴍᴇᴍᴏʀʏ ʟᴇᴠᴇʟ ɴᴏʀᴍᴀʟ**"
+                memory_status = (
+                    "✅ ᴍᴇᴍᴏʀʏ ʟᴇᴠᴇʟ ɴᴏʀᴍᴀʟ"
                 )
 
+            # ----------------------------------------------------------
+            # Diagnostic quote block
+            # ----------------------------------------------------------
+
+            _utext += (
+                "\n\n"
+                "<blockquote>"
+                "ᴍᴇᴍᴏʀʏ ᴅɪᴀɢɴᴏꜱᴛɪᴄ"
+                "\n\n"
+                f"ᴘʀᴏᴄᴇꜱꜱ ʀᴀᴍ: {process_mem}GB"
+                "\n"
+                f"ᴄᴏɴᴛᴀɪɴᴇʀ ʀᴀᴍ: {container_mem}GB"
+                "\n"
+                f"ʀᴀᴍ ʟɪᴍɪᴛ: {memory_limit}GB"
+                "\n"
+                f"ʀᴀᴍ ᴜꜱᴀɢᴇ: {memory_percent}%"
+                "\n\n"
+                f"{memory_status}"
+                "</blockquote>"
+            )
+
+    # ------------------------------------------------------------------
+    # Update final stats message
+    # ------------------------------------------------------------------
     await sent.edit_caption(_utext)
