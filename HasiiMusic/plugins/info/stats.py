@@ -172,6 +172,127 @@ def _read_smaps_rollup():
     return result
 
 
+def _read_smaps_mappings():
+    """Aggregate /proc/self/smaps by memory mapping name on Linux."""
+    mappings = {}
+    current_name = None
+    current = None
+
+    try:
+        with open("/proc/self/smaps", "r", encoding="utf-8") as f:
+            for line in f:
+                # Mapping header: address range, permissions, offset, device,
+                # inode, optional pathname.  Anonymous mappings have no path.
+                parts = line.rstrip("\n").split(maxsplit=5)
+                if len(parts) >= 5 and "-" in parts[0] and len(parts[1]) >= 4:
+                    if current_name is not None and current is not None:
+                        bucket = mappings.setdefault(current_name, {"rss": 0, "pss": 0, "private": 0, "anonymous": 0})
+                        for key in bucket:
+                            bucket[key] += current.get(key, 0)
+
+                    pathname = parts[5].strip() if len(parts) == 6 else ""
+                    if pathname:
+                        current_name = pathname
+                    elif parts[4] == "0":
+                        current_name = "[anonymous]"
+                    else:
+                        current_name = "[mapped]"
+                    current = {"rss": 0, "pss": 0, "private": 0, "anonymous": 0}
+                    continue
+
+                if current is None:
+                    continue
+
+                key, sep, value = line.partition(":")
+                if not sep:
+                    continue
+                value_parts = value.strip().split()
+                if not value_parts:
+                    continue
+                try:
+                    amount = int(value_parts[0]) * 1024
+                except ValueError:
+                    continue
+
+                if key == "Rss":
+                    current["rss"] = amount
+                elif key == "Pss":
+                    current["pss"] = amount
+                elif key == "Private_Clean":
+                    current["private"] += amount
+                elif key == "Private_Dirty":
+                    current["private"] += amount
+                elif key == "Anonymous":
+                    current["anonymous"] = amount
+
+        if current_name is not None and current is not None:
+            bucket = mappings.setdefault(current_name, {"rss": 0, "pss": 0, "private": 0, "anonymous": 0})
+            for key in bucket:
+                bucket[key] += current.get(key, 0)
+    except OSError:
+        return {}
+
+    return mappings
+
+
+def _native_memory_diagnostic():
+    """Log native/heap mapping information without changing bot behavior."""
+    mappings = _read_smaps_mappings()
+    if not mappings:
+        logger.info("Native memory map: unavailable")
+        return
+
+    heap = mappings.get("[heap]", {})
+    anonymous = mappings.get("[anonymous]", {})
+
+    logger.info(
+        "Native memory map: heap RSS=%s | anonymous RSS=%s | mappings=%d",
+        _format_mb(heap.get("rss", 0)),
+        _format_mb(anonymous.get("rss", 0)),
+        len(mappings),
+    )
+
+    # Show the largest file-backed mappings first. This is useful for spotting
+    # native media libraries without flooding Render logs with every mapping.
+    file_backed = [
+        (name, data)
+        for name, data in mappings.items()
+        if not name.startswith("[") and data.get("rss", 0) > 0
+    ]
+    file_backed.sort(key=lambda item: item[1].get("rss", 0), reverse=True)
+
+    for name, data in file_backed[:12]:
+        logger.info(
+            "MAP %s | RSS=%s | PSS=%s | Private=%s",
+            name[:180],
+            _format_mb(data.get("rss", 0)),
+            _format_mb(data.get("pss", 0)),
+            _format_mb(data.get("private", 0)),
+        )
+
+    # Explicitly highlight libraries that are relevant to the music/media
+    # stack. The match is case-insensitive and only affects diagnostics.
+    keywords = (
+        "ntgcalls", "pytgcalls", "libav", "ffmpeg", "opus", "srtp",
+        "webrtc", "nice", "ssl", "crypto", "sodium",
+    )
+    found = set()
+    for name, data in file_backed:
+        lowered = name.lower()
+        if any(keyword in lowered for keyword in keywords):
+            found.add(name)
+            logger.info(
+                "NATIVE CANDIDATE %s | RSS=%s | PSS=%s | Private=%s",
+                name[:180],
+                _format_mb(data.get("rss", 0)),
+                _format_mb(data.get("pss", 0)),
+                _format_mb(data.get("private", 0)),
+            )
+
+    if not found:
+        logger.info("NATIVE CANDIDATE: no matching media/native library mapping found")
+
+
 def _format_mb(value):
     return f"{value / (1024 ** 2):.1f}MB"
 
@@ -239,6 +360,13 @@ def _memory_diagnostic_snapshot():
     logger.info("VmData: %s | VmSwap: %s | Threads: %s | Python objects: %s",
                 vm_data, vm_swap, threads, object_count)
     logger.info("Top Python object types: %s", top_types_text)
+
+    # Detailed Linux memory mappings are diagnostic-only and do not alter
+    # the existing /stats UI or playback behavior.
+    try:
+        _native_memory_diagnostic()
+    except Exception as e:
+        logger.info("Native memory diagnostic unavailable: %s", e)
 
     if children:
         logger.info("Child processes: %d", len(children))
