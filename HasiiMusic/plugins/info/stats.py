@@ -8,15 +8,17 @@
 # Licensed under the MIT License.
 # This file is part of ˹ʜᴀꜱɪɪ ᴍᴜꜱɪᴄ˼
 
+import gc
 import os
 import platform
 import sys
+from collections import Counter
 
 import psutil
 from pyrogram import __version__, filters, types
 from pytgcalls import __version__ as pytgver
 
-from HasiiMusic import app, config, db, lang, userbot
+from HasiiMusic import app, config, db, lang, logger, userbot
 from HasiiMusic.plugins import all_modules
 
 
@@ -131,6 +133,138 @@ def _get_memory_stats():
         round(limit_gb, 2) if limit_gb is not None else None,
         round(percentage, 1),
     )
+
+
+def _read_proc_status():
+    """Read a small set of Linux process memory/thread counters."""
+    data = {}
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.partition(":")
+                if not sep:
+                    continue
+                data[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return data
+
+
+def _read_smaps_rollup():
+    """Read aggregate memory categories for the current process on Linux."""
+    result = {}
+    try:
+        with open("/proc/self/smaps_rollup", "r", encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.partition(":")
+                if not sep:
+                    continue
+                parts = value.strip().split()
+                if not parts:
+                    continue
+                try:
+                    # smaps_rollup reports kB for these fields.
+                    result[key.strip()] = int(parts[0]) * 1024
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return result
+
+
+def _format_mb(value):
+    return f"{value / (1024 ** 2):.1f}MB"
+
+
+def _memory_diagnostic_snapshot():
+    """
+    Collect diagnostic information only. This intentionally does not change
+    the /stats UI or playback behavior. The result is written to Render logs.
+    """
+    process = psutil.Process(os.getpid())
+
+    try:
+        rss = process.memory_info().rss
+    except Exception:
+        rss = 0
+
+    status = _read_proc_status()
+    smaps = _read_smaps_rollup()
+
+    # Count Python objects without forcing a collection. This is diagnostic
+    # only; avoiding gc.collect() here prevents the diagnostic itself from
+    # changing the memory profile we are trying to measure.
+    try:
+        object_count = len(gc.get_objects())
+        top_types = Counter(type(obj).__name__ for obj in gc.get_objects()).most_common(8)
+        top_types_text = ", ".join(f"{name}={count}" for name, count in top_types)
+    except Exception:
+        object_count = -1
+        top_types_text = "unavailable"
+
+    # Child processes are especially useful for detecting FFmpeg/ntgcalls
+    # helpers that remain alive after playback has stopped.
+    children = []
+    try:
+        for child in process.children(recursive=True):
+            try:
+                child_rss = child.memory_info().rss
+                cmd = " ".join(child.cmdline())[:180]
+                children.append(
+                    f"pid={child.pid} name={child.name()} rss={_format_mb(child_rss)} cmd={cmd}"
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+
+    threads = status.get("Threads", "?")
+    vm_data = status.get("VmData", "?")
+    vm_swap = status.get("VmSwap", "?")
+
+    anonymous = smaps.get("Anonymous", 0)
+    anon_huge = smaps.get("AnonHugePages", 0)
+    file_pages = smaps.get("Pss_File", 0)
+    shared = smaps.get("Shared_Clean", 0) + smaps.get("Shared_Dirty", 0)
+    private = smaps.get("Private_Clean", 0) + smaps.get("Private_Dirty", 0)
+    swap = smaps.get("Swap", 0)
+    pss = smaps.get("Pss", 0)
+
+    logger.info("=" * 72)
+    logger.info("🧠 MEMORY DIAGNOSTIC SNAPSHOT (UI unchanged)")
+    logger.info("Process RSS: %s | PSS: %s | Anonymous: %s | File-backed PSS: %s",
+                _format_mb(rss), _format_mb(pss), _format_mb(anonymous), _format_mb(file_pages))
+    logger.info("Private pages: %s | Shared pages: %s | Swap: %s | AnonHugePages: %s",
+                _format_mb(private), _format_mb(shared), _format_mb(swap), _format_mb(anon_huge))
+    logger.info("VmData: %s | VmSwap: %s | Threads: %s | Python objects: %s",
+                vm_data, vm_swap, threads, object_count)
+    logger.info("Top Python object types: %s", top_types_text)
+
+    if children:
+        logger.info("Child processes: %d", len(children))
+        for child in children:
+            logger.info("CHILD %s", child)
+    else:
+        logger.info("Child processes: 0")
+
+    # Active bot-side state counts help distinguish idle application state
+    # from native/library memory retained outside Python containers.
+    try:
+        from HasiiMusic import preload, queue, tune
+        preload_tasks = sum(len(v) for v in getattr(preload, "_preload_tasks", {}).values())
+        preloading = sum(len(v) for v in getattr(preload, "_preloading", {}).values())
+        queue_chats = len(getattr(queue, "queues", {}))
+        call_states = len(getattr(tune, "_chat_locks", {}))
+        track_states = len(getattr(tune, "_track_index", {}))
+        pending = len(getattr(tune, "_pending_transitions", set()))
+        logger.info(
+            "Bot state: queues=%d preload_tasks=%d preloading=%d call_locks=%d track_index=%d pending=%d",
+            queue_chats, preload_tasks, preloading, call_states, track_states, pending,
+        )
+    except Exception as e:
+        logger.info("Bot state diagnostics unavailable: %s", e)
+
+    logger.info("=" * 72)
 
 
 @app.on_message(filters.command(["stats"]) & ~app.bl_users)
@@ -258,6 +392,14 @@ async def _stats(_, m: types.Message):
         # ==============================================================
         # MEMORY DIAGNOSTICS
         # ==============================================================
+
+        # Keep the existing /stats UI exactly as-is. Detailed diagnostics
+        # are emitted to Render logs so we can locate the 1.4GB resident
+        # memory without changing user-facing text or playback logic.
+        try:
+            _memory_diagnostic_snapshot()
+        except Exception as e:
+            logger.warning("Memory diagnostic failed: %s", e)
 
         if container_mem is not None and memory_limit is not None:
 
