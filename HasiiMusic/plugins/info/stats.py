@@ -204,6 +204,65 @@ def _get_malloc_stats():
         return None
 
 
+def _object_retention_diagnostics(objects):
+    """Return lightweight object-retention summaries for leak localization."""
+    module_counts = Counter()
+    module_sizes = Counter()
+    large_objects = []
+    task_objects = []
+    gc_garbage_count = len(getattr(gc, "garbage", ()))
+
+    interesting_modules = (
+        "HasiiMusic", "pyrogram", "pytgcalls", "ntgcalls", "yt_dlp",
+        "aiohttp", "httpx", "httpcore", "asyncio", "pymongo", "motor",
+    )
+
+    for obj in objects:
+        try:
+            typ = type(obj)
+            mod = getattr(typ, "__module__", "unknown")
+            size = sys.getsizeof(obj)
+        except Exception:
+            continue
+
+        # Group project/dependency objects by their top-level module.
+        top = mod.split(".", 1)[0]
+        if top in interesting_modules or mod.startswith("HasiiMusic."):
+            module_counts[mod] += 1
+            module_sizes[mod] += size
+
+        if size >= 256 * 1024:
+            large_objects.append((size, mod, typ.__name__))
+
+        if typ.__name__ in {"Task", "Future"} and mod == "_asyncio":
+            task_objects.append(obj)
+
+    top_modules = module_sizes.most_common(15)
+    top_large = sorted(large_objects, reverse=True)[:20]
+
+    return top_modules, top_large, len(task_objects), gc_garbage_count
+
+
+def _asyncio_task_diagnostics():
+    """Summarize live asyncio tasks without retaining references."""
+    try:
+        import asyncio
+        tasks = asyncio.all_tasks()
+        states = Counter()
+        names = Counter()
+        for task in tasks:
+            try:
+                states["done" if task.done() else "pending"] += 1
+                name = task.get_name() if hasattr(task, "get_name") else type(task.get_coro()).__name__
+                names[str(name)[:80]] += 1
+            except Exception:
+                continue
+        top_names = ", ".join(f"{k}={v}" for k, v in names.most_common(15))
+        return len(tasks), dict(states), top_names
+    except Exception:
+        return -1, {}, "unavailable"
+
+
 async def _memory_diagnostic_snapshot():
     """
     Collect diagnostic information only. This intentionally does not change
@@ -223,9 +282,12 @@ async def _memory_diagnostic_snapshot():
     # only; avoiding gc.collect() here prevents the diagnostic itself from
     # changing the memory profile we are trying to measure.
     try:
-        object_count = len(gc.get_objects())
-        top_types = Counter(type(obj).__name__ for obj in gc.get_objects()).most_common(8)
+        objects = gc.get_objects()
+        object_count = len(objects)
+        top_types = Counter(type(obj).__name__ for obj in objects).most_common(8)
         top_types_text = ", ".join(f"{name}={count}" for name, count in top_types)
+        top_modules, top_large, task_object_count, gc_garbage_count = _object_retention_diagnostics(objects)
+        task_total, task_states, task_names = _asyncio_task_diagnostics()
     except Exception:
         object_count = -1
         top_types_text = "unavailable"
@@ -267,6 +329,19 @@ async def _memory_diagnostic_snapshot():
     logger.info("VmData: %s | VmSwap: %s | Threads: %s | Python objects: %s",
                 vm_data, vm_swap, threads, object_count)
     logger.info("Top Python object types: %s", top_types_text)
+    if top_modules:
+        module_text = ", ".join(f"{mod}={_format_mb(size)}" for mod, size in top_modules)
+        logger.info("Top tracked module shallow sizes: %s", module_text)
+    if top_large:
+        large_text = ", ".join(
+            f"{_format_mb(size)}:{mod}.{name}" for size, mod, name in top_large
+        )
+        logger.info("Large Python objects (shallow): %s", large_text)
+    logger.info(
+        "Asyncio tasks: total=%s | states=%s | live task objects=%s | gc.garbage=%s",
+        task_total, task_states, task_object_count, gc_garbage_count,
+    )
+    logger.info("Asyncio task names: %s", task_names)
 
     malloc_info = _get_malloc_stats()
     if malloc_info is not None:
