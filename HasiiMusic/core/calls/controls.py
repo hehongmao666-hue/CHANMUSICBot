@@ -95,6 +95,14 @@ class CallControls:
             ]):
                 logger.warning(f"Error leaving call for {chat_id}: {e}")
 
+        # Do not keep per-chat locks/counters forever after the voice session
+        # is gone.  The delayed cleanup also trims Linux heap pages after the
+        # native voice/download workload has released its buffers.
+        generation = self.controller._session_gen.get(chat_id, 0)
+        asyncio.create_task(
+            self.controller.cleanup_chat_state(chat_id, generation)
+        )
+
     async def seek_stream(self, chat_id: int, seconds: int) -> bool:
         """seek to a position in the current stream"""
         try:

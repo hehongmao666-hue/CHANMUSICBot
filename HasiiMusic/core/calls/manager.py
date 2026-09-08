@@ -23,7 +23,7 @@ class CallsManager:
     async def boot(self) -> None:
         PyTgCallsSession.notice_displayed = True
         for ub in userbot.clients:
-            client = PyTgCalls(ub, cache_duration=100)
+            client = PyTgCalls(ub, workers=4, cache_duration=30)
             await client.start()
             self.controller.clients.append(client)
             await self.decorators(client)

@@ -8,6 +8,7 @@
 # Licensed under the MIT License.
 # This file is part of ˹ʜᴀꜱɪɪ ᴍᴜꜱɪᴄ˼
 
+import ctypes
 import gc
 import os
 import platform
@@ -172,132 +173,38 @@ def _read_smaps_rollup():
     return result
 
 
-def _read_smaps_mappings():
-    """Aggregate /proc/self/smaps by memory mapping name on Linux."""
-    mappings = {}
-    current_name = None
-    current = None
-
-    try:
-        with open("/proc/self/smaps", "r", encoding="utf-8") as f:
-            for line in f:
-                # Mapping header: address range, permissions, offset, device,
-                # inode, optional pathname.  Anonymous mappings have no path.
-                parts = line.rstrip("\n").split(maxsplit=5)
-                if len(parts) >= 5 and "-" in parts[0] and len(parts[1]) >= 4:
-                    if current_name is not None and current is not None:
-                        bucket = mappings.setdefault(current_name, {"rss": 0, "pss": 0, "private": 0, "anonymous": 0})
-                        for key in bucket:
-                            bucket[key] += current.get(key, 0)
-
-                    pathname = parts[5].strip() if len(parts) == 6 else ""
-                    if pathname:
-                        current_name = pathname
-                    elif parts[4] == "0":
-                        current_name = "[anonymous]"
-                    else:
-                        current_name = "[mapped]"
-                    current = {"rss": 0, "pss": 0, "private": 0, "anonymous": 0}
-                    continue
-
-                if current is None:
-                    continue
-
-                key, sep, value = line.partition(":")
-                if not sep:
-                    continue
-                value_parts = value.strip().split()
-                if not value_parts:
-                    continue
-                try:
-                    amount = int(value_parts[0]) * 1024
-                except ValueError:
-                    continue
-
-                if key == "Rss":
-                    current["rss"] = amount
-                elif key == "Pss":
-                    current["pss"] = amount
-                elif key == "Private_Clean":
-                    current["private"] += amount
-                elif key == "Private_Dirty":
-                    current["private"] += amount
-                elif key == "Anonymous":
-                    current["anonymous"] = amount
-
-        if current_name is not None and current is not None:
-            bucket = mappings.setdefault(current_name, {"rss": 0, "pss": 0, "private": 0, "anonymous": 0})
-            for key in bucket:
-                bucket[key] += current.get(key, 0)
-    except OSError:
-        return {}
-
-    return mappings
-
-
-def _native_memory_diagnostic():
-    """Log native/heap mapping information without changing bot behavior."""
-    mappings = _read_smaps_mappings()
-    if not mappings:
-        logger.info("Native memory map: unavailable")
-        return
-
-    heap = mappings.get("[heap]", {})
-    anonymous = mappings.get("[anonymous]", {})
-
-    logger.info(
-        "Native memory map: heap RSS=%s | anonymous RSS=%s | mappings=%d",
-        _format_mb(heap.get("rss", 0)),
-        _format_mb(anonymous.get("rss", 0)),
-        len(mappings),
-    )
-
-    # Show the largest file-backed mappings first. This is useful for spotting
-    # native media libraries without flooding Render logs with every mapping.
-    file_backed = [
-        (name, data)
-        for name, data in mappings.items()
-        if not name.startswith("[") and data.get("rss", 0) > 0
-    ]
-    file_backed.sort(key=lambda item: item[1].get("rss", 0), reverse=True)
-
-    for name, data in file_backed[:12]:
-        logger.info(
-            "MAP %s | RSS=%s | PSS=%s | Private=%s",
-            name[:180],
-            _format_mb(data.get("rss", 0)),
-            _format_mb(data.get("pss", 0)),
-            _format_mb(data.get("private", 0)),
-        )
-
-    # Explicitly highlight libraries that are relevant to the music/media
-    # stack. The match is case-insensitive and only affects diagnostics.
-    keywords = (
-        "ntgcalls", "pytgcalls", "libav", "ffmpeg", "opus", "srtp",
-        "webrtc", "nice", "ssl", "crypto", "sodium",
-    )
-    found = set()
-    for name, data in file_backed:
-        lowered = name.lower()
-        if any(keyword in lowered for keyword in keywords):
-            found.add(name)
-            logger.info(
-                "NATIVE CANDIDATE %s | RSS=%s | PSS=%s | Private=%s",
-                name[:180],
-                _format_mb(data.get("rss", 0)),
-                _format_mb(data.get("pss", 0)),
-                _format_mb(data.get("private", 0)),
-            )
-
-    if not found:
-        logger.info("NATIVE CANDIDATE: no matching media/native library mapping found")
-
-
 def _format_mb(value):
     return f"{value / (1024 ** 2):.1f}MB"
 
 
-def _memory_diagnostic_snapshot():
+def _get_malloc_stats():
+    """Return glibc allocator totals when available."""
+    try:
+        libc = ctypes.CDLL(None)
+        if not hasattr(libc, "mallinfo2"):
+            return None
+
+        class Mallinfo2(ctypes.Structure):
+            _fields_ = [
+                ("arena", ctypes.c_size_t),
+                ("ordblks", ctypes.c_size_t),
+                ("smblks", ctypes.c_size_t),
+                ("hblks", ctypes.c_size_t),
+                ("hblkhd", ctypes.c_size_t),
+                ("usmblks", ctypes.c_size_t),
+                ("fsmblks", ctypes.c_size_t),
+                ("uordblks", ctypes.c_size_t),
+                ("fordblks", ctypes.c_size_t),
+                ("keepcost", ctypes.c_size_t),
+            ]
+
+        libc.mallinfo2.restype = Mallinfo2
+        return libc.mallinfo2()
+    except Exception:
+        return None
+
+
+async def _memory_diagnostic_snapshot():
     """
     Collect diagnostic information only. This intentionally does not change
     the /stats UI or playback behavior. The result is written to Render logs.
@@ -361,12 +268,16 @@ def _memory_diagnostic_snapshot():
                 vm_data, vm_swap, threads, object_count)
     logger.info("Top Python object types: %s", top_types_text)
 
-    # Detailed Linux memory mappings are diagnostic-only and do not alter
-    # the existing /stats UI or playback behavior.
-    try:
-        _native_memory_diagnostic()
-    except Exception as e:
-        logger.info("Native memory diagnostic unavailable: %s", e)
+    malloc_info = _get_malloc_stats()
+    if malloc_info is not None:
+        logger.info(
+            "glibc malloc: arena=%s | in_use=%s | free=%s | mmap=%s | keepcost=%s",
+            _format_mb(malloc_info.arena),
+            _format_mb(malloc_info.uordblks),
+            _format_mb(malloc_info.fordblks),
+            _format_mb(malloc_info.hblkhd),
+            _format_mb(malloc_info.keepcost),
+        )
 
     if children:
         logger.info("Child processes: %d", len(children))
@@ -379,16 +290,64 @@ def _memory_diagnostic_snapshot():
     # from native/library memory retained outside Python containers.
     try:
         from HasiiMusic import preload, queue, tune
-        preload_tasks = sum(len(v) for v in getattr(preload, "_preload_tasks", {}).values())
-        preloading = sum(len(v) for v in getattr(preload, "_preloading", {}).values())
-        queue_chats = len(getattr(queue, "queues", {}))
-        call_states = len(getattr(tune, "_chat_locks", {}))
-        track_states = len(getattr(tune, "_track_index", {}))
-        pending = len(getattr(tune, "_pending_transitions", set()))
+        preload_tasks_map = getattr(preload, "_preload_tasks", {})
+        preloading_map = getattr(preload, "_preloading", {})
+        queues_map = getattr(queue, "queues", {})
+        locks_map = getattr(tune, "_chat_locks", {})
+        track_map = getattr(tune, "_track_index", {})
+        session_map = getattr(tune, "_session_gen", {})
+        pending_map = getattr(tune, "_pending_transitions", set())
+
+        preload_tasks = sum(len(v) for v in preload_tasks_map.values())
+        preloading = sum(len(v) for v in preloading_map.values())
+        queue_chats = len(queues_map)
+        call_states = len(locks_map)
+        track_states = len(track_map)
+        pending = len(pending_map)
         logger.info(
             "Bot state: queues=%d preload_tasks=%d preloading=%d call_locks=%d track_index=%d pending=%d",
             queue_chats, preload_tasks, preloading, call_states, track_states, pending,
         )
+
+        if queues_map:
+            for chat_id, q in list(queues_map.items())[:20]:
+                current = q[0] if q else None
+                logger.info(
+                    "QUEUE STATE chat=%s len=%d current_id=%s file=%s",
+                    chat_id,
+                    len(q),
+                    getattr(current, "id", None) if current else None,
+                    getattr(current, "file_path", None) if current else None,
+                )
+
+        if locks_map:
+            for chat_id, lock in list(locks_map.items())[:20]:
+                logger.info(
+                    "CALL STATE chat=%s lock_locked=%s track_index=%s session_gen=%s pending=%s",
+                    chat_id,
+                    bool(lock.locked()),
+                    track_map.get(chat_id),
+                    session_map.get(chat_id),
+                    chat_id in pending_map,
+                )
+
+        # Compare persisted DB playback records with in-memory state.
+        try:
+            db_chats = await db.get_chats()
+            active_db = []
+            for chat_id in db_chats[:50]:
+                try:
+                    if await db.get_call(chat_id):
+                        active_db.append(chat_id)
+                except Exception:
+                    continue
+            logger.info(
+                "DB playback state: chats_checked=%d active_calls=%s",
+                len(db_chats[:50]),
+                active_db[:20],
+            )
+        except Exception as e:
+            logger.info("DB playback diagnostics unavailable: %s", e)
     except Exception as e:
         logger.info("Bot state diagnostics unavailable: %s", e)
 
@@ -525,7 +484,7 @@ async def _stats(_, m: types.Message):
         # are emitted to Render logs so we can locate the 1.4GB resident
         # memory without changing user-facing text or playback logic.
         try:
-            _memory_diagnostic_snapshot()
+            await _memory_diagnostic_snapshot()
         except Exception as e:
             logger.warning("Memory diagnostic failed: %s", e)
 

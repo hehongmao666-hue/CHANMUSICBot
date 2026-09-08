@@ -10,9 +10,13 @@
 """
 
 import asyncio
+import ctypes
+import gc
 import logging
+import sys
 from pytgcalls import PyTgCalls
 from pyrogram.types import Message
+from HasiiMusic import db, logger, queue
 from HasiiMusic.helpers import Media, Track
 
 from .utils import CallsUtils, PyTgCallsErrorFilter
@@ -45,6 +49,52 @@ class TgCall(PyTgCalls):
         if chat_id not in self._chat_locks:
             self._chat_locks[chat_id] = asyncio.Lock()
         return self._chat_locks[chat_id]
+
+    async def cleanup_chat_state(self, chat_id: int, generation: int) -> None:
+        """Release lightweight per-chat Python state after a full stop.
+
+        The cleanup is delayed by one event-loop turn so callers that are
+        currently inside ``async with get_lock(chat_id)`` can release the lock
+        before we remove it.  The generation check prevents an old cleanup
+        task from deleting state belonging to a new playback session.
+        """
+        try:
+            await asyncio.sleep(0.2)
+
+            if self._session_gen.get(chat_id) != generation:
+                return
+            if await db.get_call(chat_id):
+                return
+            if queue.get_current(chat_id) is not None:
+                return
+
+            lock = self._chat_locks.get(chat_id)
+            if lock is not None and lock.locked():
+                return
+
+            self._pending_transitions.discard(chat_id)
+            self._track_index.pop(chat_id, None)
+            self._session_gen.pop(chat_id, None)
+            self._chat_locks.pop(chat_id, None)
+
+            logger.debug(f"🧹 Released idle playback state for {chat_id}")
+
+            await asyncio.to_thread(self.release_idle_memory)
+        except Exception as e:
+            logger.debug(f"Idle state cleanup failed for {chat_id}: {e}")
+
+    @staticmethod
+    def release_idle_memory() -> None:
+        """Ask the allocator to return unused heap pages to Linux when possible."""
+        try:
+            gc.collect()
+            if sys.platform.startswith("linux"):
+                libc = ctypes.CDLL(None)
+                malloc_trim = getattr(libc, "malloc_trim", None)
+                if malloc_trim is not None:
+                    malloc_trim(0)
+        except Exception:
+            pass
 
     async def boot(self) -> None:
         return await self._manager.boot()

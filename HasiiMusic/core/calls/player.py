@@ -84,9 +84,9 @@ class CallPlayer:
         # Configure audio stream with optimized buffering for lag-free playback. larger buffers help reduce playback lag
         if seek_time > 1:
             # seek to the position first and keep the buffers
-            ffmpeg_params = f"-ss {seek_time} -probesize 10M -analyzeduration 5M -rtbufsize 5M -fflags +genpts+igndts"
+            ffmpeg_params = f"-ss {seek_time} -probesize 4M -analyzeduration 2M -rtbufsize 2M -fflags +genpts+igndts"
         else:
-            ffmpeg_params = "-probesize 10M -analyzeduration 5M -rtbufsize 5M -fflags +genpts+igndts -sync ext"
+            ffmpeg_params = "-probesize 4M -analyzeduration 2M -rtbufsize 2M -fflags +genpts+igndts -sync ext"
 
         is_video = getattr(media, "video", False)
         video_flags = (
@@ -97,7 +97,7 @@ class CallPlayer:
 
         kwargs = {
             "media_path": media.file_path,
-            "audio_parameters": types.AudioQuality.STUDIO,
+            "audio_parameters": types.AudioQuality.HIGH,
             "audio_flags": types.MediaStream.Flags.REQUIRED,
             "video_flags": video_flags,
             "ffmpeg_parameters": ffmpeg_params,
