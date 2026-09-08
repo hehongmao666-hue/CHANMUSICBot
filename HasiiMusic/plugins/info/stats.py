@@ -281,23 +281,40 @@ async def _memory_diagnostic_snapshot():
     # Count Python objects without forcing a collection. This is diagnostic
     # only; avoiding gc.collect() here prevents the diagnostic itself from
     # changing the memory profile we are trying to measure.
+    # Keep every diagnostic field initialized so one failing sub-check never
+    # aborts the rest of the snapshot.
+    object_count = -1
+    top_types_text = "unavailable"
+    top_modules = []
+    top_large = []
+    task_object_count = -1
+    gc_garbage_count = -1
+    task_total = -1
+    task_states = {}
+    task_names = "unavailable"
+
     try:
         objects = gc.get_objects()
         object_count = len(objects)
-        top_types = Counter(type(obj).__name__ for obj in objects).most_common(8)
-        top_types_text = ", ".join(f"{name}={count}" for name, count in top_types)
-        top_modules, top_large, task_object_count, gc_garbage_count = _object_retention_diagnostics(objects)
+        try:
+            top_types = Counter(type(obj).__name__ for obj in objects).most_common(8)
+            top_types_text = ", ".join(f"{name}={count}" for name, count in top_types)
+        except Exception as exc:
+            logger.warning("Memory diagnostic object-type scan failed: %s", exc)
+
+        try:
+            (top_modules, top_large, task_object_count, gc_garbage_count) = _object_retention_diagnostics(objects)
+        except Exception as exc:
+            logger.warning("Memory diagnostic retention scan failed: %s", exc)
+
+        del objects
+    except Exception as exc:
+        logger.warning("Memory diagnostic object scan failed: %s", exc)
+
+    try:
         task_total, task_states, task_names = _asyncio_task_diagnostics()
-    except Exception:
-        object_count = -1
-        top_types_text = "unavailable"
-        top_modules = []
-        top_large = []
-        task_object_count = -1
-        gc_garbage_count = -1
-        task_total = -1
-        task_states = {}
-        task_names = "unavailable"
+    except Exception as exc:
+        logger.warning("Memory diagnostic asyncio scan failed: %s", exc)
 
     # Child processes are especially useful for detecting FFmpeg/ntgcalls
     # helpers that remain alive after playback has stopped.
