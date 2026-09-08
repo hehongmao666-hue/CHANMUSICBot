@@ -291,6 +291,13 @@ async def _memory_diagnostic_snapshot():
     except Exception:
         object_count = -1
         top_types_text = "unavailable"
+        top_modules = []
+        top_large = []
+        task_object_count = -1
+        gc_garbage_count = -1
+        task_total = -1
+        task_states = {}
+        task_names = "unavailable"
 
     # Child processes are especially useful for detecting FFmpeg/ntgcalls
     # helpers that remain alive after playback has stopped.
