@@ -12,6 +12,7 @@
 
 import asyncio
 from ntgcalls import ConnectionNotFound, TelegramServerError
+import ntgcalls
 from pytgcalls import PyTgCalls, exceptions, types
 from pytgcalls.pytgcalls_session import PyTgCallsSession
 from HasiiMusic import db, logger, userbot
@@ -27,7 +28,11 @@ class CallsManager:
             await client.start()
             self.controller.clients.append(client)
             await self.decorators(client)
-        logger.info("📞 PyTgCalls client(s) started.")
+        logger.info(
+            "📞 PyTgCalls client(s) started. py-tgcalls=%s ntgcalls=%s",
+            getattr(__import__("pytgcalls"), "__version__", "unknown"),
+            getattr(ntgcalls, "__version__", "unknown"),
+        )
 
     async def ping(self) -> float:
         if not self.controller.clients:

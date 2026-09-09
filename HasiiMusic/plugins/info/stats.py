@@ -10,6 +10,7 @@
 
 import ctypes
 import gc
+import inspect
 import os
 import platform
 import sys
@@ -204,6 +205,86 @@ def _get_malloc_stats():
         return None
 
 
+def _safe_size(value):
+    """Return a cheap size for common container-like diagnostic values."""
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+
+async def _native_call_diagnostics():
+    """Inspect PyTgCalls Python-side/native binding state without mutating it."""
+    try:
+        from HasiiMusic import tune
+    except Exception:
+        return
+
+    clients = getattr(tune, "clients", [])
+    logger.info("Native call diagnostics: pytgcalls_clients=%d", len(clients))
+
+    for index, client in enumerate(list(clients)):
+        binding = getattr(client, "_binding", None)
+        logger.info(
+            "NATIVE CLIENT %d: type=%s binding=%s executor=%s",
+            index,
+            type(client).__name__,
+            type(binding).__name__ if binding is not None else "none",
+            type(getattr(client, "_executor", None)).__name__,
+        )
+
+        # These names are intentionally probed rather than assumed to exist.
+        # They are internal PyTgCalls caches, so diagnostics must remain
+        # compatible across 2.x/3.x without changing playback behavior.
+        for owner_name, owner in (("pytgcalls", client), ("binding", binding)):
+            if owner is None:
+                continue
+            fields = []
+            for attr in (
+                "_call_sources",
+                "_wait_connect",
+                "_pending_connections",
+                "_p2p_configs",
+                "_cache_user_peer",
+                "_need_unmute",
+                "_presentations",
+                "_call_types",
+                "_calls",
+            ):
+                if not hasattr(owner, attr):
+                    continue
+                try:
+                    value = getattr(owner, attr)
+                    size = _safe_size(value)
+                    if size is not None:
+                        fields.append(f"{attr}={size}")
+                    else:
+                        fields.append(f"{attr}=present")
+                except Exception:
+                    fields.append(f"{attr}=error")
+            if fields:
+                logger.info("NATIVE %s CLIENT %d: %s", owner_name, index, " | ".join(fields))
+
+        # ntgcalls exposes a native binding object.  Some releases expose a
+        # callable `calls` accessor; use it only when it is clearly awaitable
+        # and never mutate/stop anything.
+        if binding is not None:
+            try:
+                accessor = getattr(binding, "calls", None)
+                if callable(accessor):
+                    result = accessor()
+                    if inspect.isawaitable(result):
+                        result = await result
+                    size = _safe_size(result)
+                    logger.info(
+                        "NATIVE binding.calls CLIENT %d: %s",
+                        index,
+                        size if size is not None else "present",
+                    )
+            except Exception as e:
+                logger.debug("Native calls() diagnostic unavailable for client %d: %s", index, e)
+
+
 async def _memory_diagnostic_snapshot():
     """
     Collect diagnostic information only. This intentionally does not change
@@ -365,6 +446,16 @@ async def _memory_diagnostic_snapshot():
             logger.info("DB playback diagnostics unavailable: %s", e)
     except Exception as e:
         logger.info("Bot state diagnostics unavailable: %s", e)
+
+    try:
+        await tune.reconcile_idle_state()
+    except Exception as e:
+        logger.debug("Idle state reconciliation unavailable: %s", e)
+
+    try:
+        await _native_call_diagnostics()
+    except Exception as e:
+        logger.debug("Native call diagnostics failed: %s", e)
 
     logger.info("=" * 72)
 

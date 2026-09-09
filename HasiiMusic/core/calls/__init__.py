@@ -120,6 +120,43 @@ class TgCall(PyTgCalls):
         except Exception as e:
             logger.debug(f"Idle state cleanup failed for {chat_id}: {e}")
 
+    async def reconcile_idle_state(self) -> int:
+        """Schedule cleanup for in-memory chat state that is no longer active.
+
+        This is deliberately conservative: a state entry is considered idle
+        only when MongoDB has no active call, the local queue has no current
+        track, and there is no transition task still running.  Native
+        PyTgCalls state is *not* forcefully manipulated here.
+        """
+        cleaned = 0
+        for chat_id in list(self._chat_locks):
+            try:
+                if chat_id in self._stopping:
+                    continue
+                if self._transition_tasks.get(chat_id) is not None:
+                    task = self._transition_tasks.get(chat_id)
+                    if task is not None and not task.done():
+                        continue
+                if await db.get_call(chat_id):
+                    continue
+                if queue.get_current(chat_id) is not None:
+                    continue
+                generation = self._session_gen.get(chat_id)
+                if generation is None:
+                    # A lock without a generation is stale by definition.
+                    self._chat_locks.pop(chat_id, None)
+                    self._track_index.pop(chat_id, None)
+                    self._pending_transitions.discard(chat_id)
+                    cleaned += 1
+                    continue
+                asyncio.create_task(
+                    self.cleanup_chat_state(chat_id, generation),
+                    name=f"cleanup_idle:{chat_id}",
+                )
+            except Exception:
+                continue
+        return cleaned
+
     @staticmethod
     def release_idle_memory() -> None:
         """Ask the allocator to return unused heap pages to Linux when possible."""
