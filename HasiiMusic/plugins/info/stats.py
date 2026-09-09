@@ -96,12 +96,32 @@ def _get_container_memory():
     return None, None
 
 
+def _get_process_tree_memory():
+    """Return this process RSS plus recursive child-process RSS in GB."""
+    process = psutil.Process(os.getpid())
+    total = 0
+    try:
+        total += process.memory_info().rss
+    except Exception:
+        pass
+    try:
+        for child in process.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return total / (1024 ** 3)
+
+
 def _get_memory_stats():
     """
     Collect process RAM + container RAM.
 
     Returns:
         process_gb
+        app_tree_gb
         container_gb
         limit_gb
         percentage
@@ -120,17 +140,26 @@ def _get_memory_stats():
     process_gb = process_rss / (1024 ** 3)
 
     # ------------------------------------------------------------------
-    # Render / container memory
+    # App tree RSS = bot process + FFmpeg/other child processes.
+    # This is much closer to what Render's application graph represents
+    # than cgroup memory.current, which can also include page cache and
+    # other cgroup-accounted memory.
     # ------------------------------------------------------------------
+    app_tree_gb = _get_process_tree_memory()
+
+    # Keep cgroup accounting as a separate diagnostic value. Do not use it
+    # as the primary /stats RAM percentage because it is not directly
+    # comparable with Render Application Metrics.
     container_gb, limit_gb = _get_container_memory()
 
-    if container_gb is not None and limit_gb:
-        percentage = (container_gb / limit_gb) * 100
+    if app_tree_gb and limit_gb:
+        percentage = (app_tree_gb / limit_gb) * 100
     else:
         percentage = 0
 
     return (
         round(process_gb, 2),
+        round(app_tree_gb, 2),
         round(container_gb, 2) if container_gb is not None else None,
         round(limit_gb, 2) if limit_gb is not None else None,
         round(percentage, 1),
@@ -504,6 +533,7 @@ async def _stats(_, m: types.Message):
 
         (
             process_mem,
+            app_tree_mem,
             container_mem,
             memory_limit,
             memory_percent,
@@ -512,10 +542,12 @@ async def _stats(_, m: types.Message):
         # ------------------------------------------------------------------
         # Main RAM line
         # ------------------------------------------------------------------
-        if container_mem is not None and memory_limit is not None:
+        if memory_limit is not None:
 
+            # Primary RAM number: bot process + child processes (mainly
+            # FFmpeg), which is much closer to Render Application Metrics.
             memory_line = (
-                f"{container_mem}GB | {memory_limit}GB "
+                f"{app_tree_mem}GB | {memory_limit}GB "
                 f"({memory_percent}%)"
             )
 
@@ -529,7 +561,7 @@ async def _stats(_, m: types.Message):
             )
 
             memory_line = (
-                f"{process_mem}GB | {total_mem}GB"
+                f"{app_tree_mem}GB | {total_mem}GB"
             )
 
         # ==============================================================
@@ -629,7 +661,9 @@ async def _stats(_, m: types.Message):
                 "\n\n"
                 f"ᴘʀᴏᴄᴇꜱꜱ ʀᴀᴍ: {process_mem}GB"
                 "\n"
-                f"ᴄᴏɴᴛᴀɪɴᴇʀ ʀᴀᴍ: {container_mem}GB"
+                f"ᴀᴘᴘ + ꜰꜰᴍᴘᴇɢ ʀᴀᴍ: {app_tree_mem}GB"
+                "\n"
+                f"ᴄɢʀᴏᴜᴘ ʀᴀᴍ: {container_mem}GB"
                 "\n"
                 f"ʀᴀᴍ ʟɪᴍɪᴛ: {memory_limit}GB"
                 "\n"
