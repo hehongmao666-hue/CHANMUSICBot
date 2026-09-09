@@ -17,6 +17,7 @@ import glob
 import time
 import os
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +43,7 @@ class Downloader:
 
         # Prevent duplicate downloads of the same video.
         self._download_locks: dict = {}
+        self._download_lock_refs: dict = {}
 
         self._max_video_height = getattr(
             config,
@@ -218,14 +220,28 @@ class Downloader:
         self,
         video_id: str
     ) -> asyncio.Lock:
+        lock = self._download_locks.get(video_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._download_locks[video_id] = lock
+            self._download_lock_refs[video_id] = 0
+        return lock
 
-        if video_id not in self._download_locks:
-
-            self._download_locks[video_id] = (
-                asyncio.Lock()
-            )
-
-        return self._download_locks[video_id]
+    @asynccontextmanager
+    async def _download_lock_context(self, video_id: str):
+        lock = self._get_download_lock(video_id)
+        self._download_lock_refs[video_id] = self._download_lock_refs.get(video_id, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            refs = self._download_lock_refs.get(video_id, 0) - 1
+            if refs > 0:
+                self._download_lock_refs[video_id] = refs
+            else:
+                self._download_lock_refs.pop(video_id, None)
+                if self._download_locks.get(video_id) is lock and not lock.locked():
+                    self._download_locks.pop(video_id, None)
 
     # ==========================================================================
     # MAIN DOWNLOAD
@@ -596,9 +612,7 @@ class Downloader:
         # PER VIDEO LOCK
         # ==========================================================================
 
-        async with self._get_download_lock(
-            video_id
-        ):
+        async with self._download_lock_context(video_id):
 
             cached = _check_cache()
 

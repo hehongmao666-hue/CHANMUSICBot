@@ -76,6 +76,13 @@ class CallControls:
         self.controller._transition_tasks.pop(chat_id, None)
         client = await db.get_assistant(chat_id)
 
+        # Cancel background playlist expansion before clearing the queue.
+        # A late playlist fetch must never repopulate a stopped chat.
+        try:
+            await self.controller._queue.cancel_playlist_tasks(chat_id)
+        except Exception as e:
+            logger.debug(f"Error cancelling playlist task for {chat_id}: {e}")
+
         # Cancel any active preload tasks when stopping
         try:
             await preload.cancel_preload(chat_id)

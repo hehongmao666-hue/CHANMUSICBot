@@ -12,6 +12,7 @@
 import json
 import re
 import urllib.request
+from collections import OrderedDict
 from typing import List, Tuple
 from HasiiMusic import logger
 
@@ -19,7 +20,9 @@ class EmbedScraper:
     def __init__(self):
         # Cache for embed fallback: (item_type, item_id) -> (title, [raw_tracks])
         # Avoids re-downloading the full embed HTML on each paginated batch fetch
-        self._embed_cache: dict = {}
+        self._embed_cache = OrderedDict()
+        self._max_cache_entries = 20
+        self._max_cached_tracks = 2000
 
     def fetch_embed_tracks(self, item_type: str, item_id: str, limit: int = 0, offset: int = 0) -> Tuple[str, List[dict]]:
         """Fallback extractor using Spotify embed page (bypasses 403 API restriction).
@@ -31,7 +34,8 @@ class EmbedScraper:
 
         # --- Serve from cache if available ---
         if cache_key in self._embed_cache:
-            cached_title, all_tracks = self._embed_cache[cache_key]
+            cached_title, all_tracks = self._embed_cache.pop(cache_key)
+            self._embed_cache[cache_key] = (cached_title, all_tracks)
             sliced = all_tracks[offset: offset + limit] if limit else all_tracks[offset:]
             return cached_title, sliced
 
@@ -102,7 +106,13 @@ class EmbedScraper:
             except Exception as e:
                 logger.debug(f"oEmbed parser failed for {item_type}/{item_id}: {e}")
 
-        # Store full tracklist in cache for future paginated fetches
-        self._embed_cache[cache_key] = (collection_title, all_raw_tracks)
+        # Bound the raw-track cache so a long-running bot cannot retain
+        # every Spotify collection ever requested.
+        self._embed_cache.pop(cache_key, None)
+        if len(all_raw_tracks) <= self._max_cached_tracks:
+            self._embed_cache[cache_key] = (collection_title, all_raw_tracks)
+            while (len(self._embed_cache) > self._max_cache_entries or
+                   sum(len(v[1]) for v in self._embed_cache.values()) > self._max_cached_tracks):
+                self._embed_cache.popitem(last=False)
         sliced = all_raw_tracks[offset: offset + limit] if limit else all_raw_tracks[offset:]
         return collection_title, sliced

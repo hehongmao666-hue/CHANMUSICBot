@@ -18,6 +18,7 @@ from HasiiMusic import app, config, db, lang, logger, preload, queue, yt
 class CallQueue:
     def __init__(self, controller):
         self.controller = controller
+        self._playlist_tasks = {}
 
     async def replay(self, chat_id: int) -> None:
         try:
@@ -236,14 +237,12 @@ class CallQueue:
                 next_offset = (pl_idx // pl_limit + 1) * pl_limit
                 if next_offset < pl_max:
                     batch_limit = min(pl_limit, pl_max - next_offset)
-                    asyncio.create_task(
-                        self._fetch_next_playlist_batch(
-                            chat_id=chat_id,
-                            playlist_url=pl_url,
-                            user=media.user,
-                            offset=next_offset,
-                            limit=batch_limit,
-                        )
+                    self._schedule_playlist_batch(
+                        chat_id=chat_id,
+                        playlist_url=pl_url,
+                        user=media.user,
+                        offset=next_offset,
+                        limit=batch_limit,
                     )
         except Exception as e:
             logger.error(
@@ -253,14 +252,54 @@ class CallQueue:
             except Exception:
                 pass
 
+    def _schedule_playlist_batch(
+        self, chat_id: int, playlist_url: str, user: str, offset: int, limit: int
+    ) -> None:
+        existing = self._playlist_tasks.get(chat_id)
+        if existing is not None and not existing.done():
+            return
+        generation = self.controller._session_gen.get(chat_id, 0)
+        task = asyncio.create_task(
+            self._fetch_next_playlist_batch(
+                chat_id=chat_id, playlist_url=playlist_url, user=user,
+                offset=offset, limit=limit, generation=generation,
+            ),
+            name=f"playlist_batch:{chat_id}",
+        )
+        self._playlist_tasks[chat_id] = task
+        task.add_done_callback(
+            lambda done, cid=chat_id: self._playlist_task_done(cid, done)
+        )
+
+    def _playlist_task_done(self, chat_id: int, task: asyncio.Task) -> None:
+        if self._playlist_tasks.get(chat_id) is task:
+            self._playlist_tasks.pop(chat_id, None)
+
+    async def cancel_playlist_tasks(self, chat_id: int) -> None:
+        task = self._playlist_tasks.pop(chat_id, None)
+        if task is None:
+            return
+        if not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _fetch_next_playlist_batch(
-        self, chat_id: int, playlist_url: str, user: str, offset: int, limit: int = 30
+        self, chat_id: int, playlist_url: str, user: str, offset: int, limit: int = 30,
+        generation: int | None = None,
     ) -> None:
         try:
             from HasiiMusic import spotify, queue
             if spotify.valid(playlist_url) and spotify.is_playlist(playlist_url):
+                if chat_id in self.controller._stopping or not await db.get_call(chat_id):
+                    return
+                if generation is not None and self.controller._session_gen.get(chat_id, 0) != generation:
+                    return
                 next_tracks = await spotify.playlist(limit, user, playlist_url, offset=offset)
                 if next_tracks:
+                    if chat_id in self.controller._stopping or not await db.get_call(chat_id):
+                        return
+                    if generation is not None and self.controller._session_gen.get(chat_id, 0) != generation:
+                        return
                     for track in next_tracks:
                         queue.add(chat_id, track)
                     logger.info(
