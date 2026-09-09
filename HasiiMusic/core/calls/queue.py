@@ -32,8 +32,18 @@ class CallQueue:
             logger.error(f"Error in replay for {chat_id}: {e}", exc_info=True)
 
     async def play_next(self, chat_id: int, expected_index: int = None) -> None:
+        if chat_id in self.controller._stopping:
+            self.controller._pending_transitions.discard(chat_id)
+            return
+        if not await db.get_call(chat_id):
+            self.controller._pending_transitions.discard(chat_id)
+            return
+
         lock = self.controller.get_lock(chat_id)
         async with lock:
+            if chat_id in self.controller._stopping or not await db.get_call(chat_id):
+                self.controller._pending_transitions.discard(chat_id)
+                return
             self.controller._pending_transitions.discard(chat_id)
             if expected_index is not None and self.controller._track_index.get(chat_id, 0) != expected_index:
                 logger.info(f"Skipping stale play_next for {chat_id}")
@@ -211,8 +221,7 @@ class CallQueue:
                 await self.controller._player._play_media_impl(chat_id, None, media)
 
             try:
-                asyncio.create_task(
-                    preload.start_preload(chat_id, count=1))
+                await preload.start_preload(chat_id, count=1)
             except Exception as e:
                 logger.debug(
                     f"Error starting preload after play_next for {chat_id}: {e}")

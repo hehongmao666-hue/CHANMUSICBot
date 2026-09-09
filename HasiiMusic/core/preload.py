@@ -150,10 +150,9 @@ class PreloadManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Clean up tracking
-        self._preload_tasks[chat_id].clear()
-        if chat_id in self._preloading:
-            self._preloading[chat_id].clear()
+        # Clean up tracking completely.
+        self._preload_tasks.pop(chat_id, None)
+        self._preloading.pop(chat_id, None)
     
     def _cleanup_task(self, chat_id: int, task: asyncio.Task) -> None:
         """

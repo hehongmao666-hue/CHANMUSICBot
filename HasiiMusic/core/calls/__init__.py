@@ -37,6 +37,8 @@ class TgCall(PyTgCalls):
         self._session_gen = {}
         self._track_index = {}
         self._pending_transitions = set()
+        self._transition_tasks = {}
+        self._stopping = set()
 
         # Components
         self._utils = CallsUtils(self)
@@ -45,21 +47,46 @@ class TgCall(PyTgCalls):
         self._controls = CallControls(self)
         self._queue = CallQueue(self)
 
+    def begin_session(self, chat_id: int) -> int:
+        """Start a new user-requested playback session for a chat."""
+        self._stopping.discard(chat_id)
+        generation = self._session_gen.get(chat_id, 0) + 1
+        self._session_gen[chat_id] = generation
+        self._track_index[chat_id] = 0
+        self._pending_transitions.discard(chat_id)
+        return generation
+
+    def _transition_done(self, chat_id: int, task: asyncio.Task) -> None:
+        current = self._transition_tasks.get(chat_id)
+        if current is task:
+            self._transition_tasks.pop(chat_id, None)
+
+    def schedule_transition(self, chat_id: int, expected_index: int) -> None:
+        """Schedule at most one stream transition per chat."""
+        if chat_id in self._stopping:
+            return
+        existing = self._transition_tasks.get(chat_id)
+        if existing is not None and not existing.done():
+            return
+        self._pending_transitions.add(chat_id)
+        task = asyncio.create_task(
+            self._queue.play_next(chat_id, expected_index),
+            name=f"play_next:{chat_id}",
+        )
+        self._transition_tasks[chat_id] = task
+        task.add_done_callback(
+            lambda done, cid=chat_id: self._transition_done(cid, done)
+        )
+
     def get_lock(self, chat_id: int) -> asyncio.Lock:
         if chat_id not in self._chat_locks:
             self._chat_locks[chat_id] = asyncio.Lock()
         return self._chat_locks[chat_id]
 
     async def cleanup_chat_state(self, chat_id: int, generation: int) -> None:
-        """Release lightweight per-chat Python state after a full stop.
-
-        The cleanup is delayed by one event-loop turn so callers that are
-        currently inside ``async with get_lock(chat_id)`` can release the lock
-        before we remove it.  The generation check prevents an old cleanup
-        task from deleting state belonging to a new playback session.
-        """
+        """Remove all lightweight state after a chat has fully stopped."""
         try:
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)
 
             if self._session_gen.get(chat_id) != generation:
                 return
@@ -68,18 +95,28 @@ class TgCall(PyTgCalls):
             if queue.get_current(chat_id) is not None:
                 return
 
-            lock = self._chat_locks.get(chat_id)
-            if lock is not None and lock.locked():
+            for _ in range(10):
+                lock = self._chat_locks.get(chat_id)
+                if lock is None or not lock.locked():
+                    break
+                await asyncio.sleep(0.5)
+            else:
                 return
 
             self._pending_transitions.discard(chat_id)
             self._track_index.pop(chat_id, None)
             self._session_gen.pop(chat_id, None)
             self._chat_locks.pop(chat_id, None)
+            self._stopping.discard(chat_id)
+
+            transition = self._transition_tasks.pop(chat_id, None)
+            if transition is not None and not transition.done():
+                transition.cancel()
 
             logger.debug(f"🧹 Released idle playback state for {chat_id}")
-
             await asyncio.to_thread(self.release_idle_memory)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug(f"Idle state cleanup failed for {chat_id}: {e}")
 

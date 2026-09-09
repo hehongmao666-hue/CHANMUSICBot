@@ -60,7 +60,20 @@ class CallControls:
             await self._stop_impl(chat_id)
 
     async def _stop_impl(self, chat_id: int) -> None:
+        self.controller._stopping.add(chat_id)
         self.controller._session_gen[chat_id] = self.controller._session_gen.get(chat_id, 0) + 1
+
+        transition = self.controller._transition_tasks.get(chat_id)
+        current_task = asyncio.current_task()
+        if transition is not None and transition is not current_task and not transition.done():
+            transition.cancel()
+            try:
+                await transition
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self.controller._transition_tasks.pop(chat_id, None)
         client = await db.get_assistant(chat_id)
 
         # Cancel any active preload tasks when stopping

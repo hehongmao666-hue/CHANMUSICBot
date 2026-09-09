@@ -14,7 +14,7 @@ import asyncio
 from ntgcalls import ConnectionNotFound, TelegramServerError
 from pytgcalls import PyTgCalls, exceptions, types
 from pytgcalls.pytgcalls_session import PyTgCallsSession
-from HasiiMusic import logger, userbot
+from HasiiMusic import db, logger, userbot
 
 class CallsManager:
     def __init__(self, controller):
@@ -42,10 +42,15 @@ class CallsManager:
                 if isinstance(update, types.StreamEnded):
                     if update.stream_type == types.StreamEnded.Type.AUDIO:
                         chat_id = update.chat_id
+                        if chat_id in self.controller._stopping:
+                            return
+                        # A delayed StreamEnded can arrive after /stop or queue end.
+                        # Do not recreate locks/track state for an already-idle chat.
+                        if not await db.get_call(chat_id):
+                            self.controller._pending_transitions.discard(chat_id)
+                            return
                         expected_index = self.controller._track_index.get(chat_id, 0)
-                        if chat_id not in self.controller._pending_transitions:
-                            self.controller._pending_transitions.add(chat_id)
-                            asyncio.create_task(self.controller._queue.play_next(chat_id, expected_index))
+                        self.controller.schedule_transition(chat_id, expected_index)
                 elif isinstance(update, types.ChatUpdate):
                     if update.status in [
                         types.ChatUpdate.Status.KICKED,

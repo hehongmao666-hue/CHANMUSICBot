@@ -33,6 +33,7 @@ class CallPlayer:
         seek_time: int = 0,
     ) -> None:
         async with self.controller.get_lock(chat_id):
+            self.controller.begin_session(chat_id)
             await self._play_media_impl(
                 chat_id, message, media, seek_time
             )
@@ -121,17 +122,11 @@ class CallPlayer:
             
         stream = types.MediaStream(**kwargs)
 
-        try:
-            # ALWAYS attempt to leave the call before starting a new stream to clear ghost streams
-            # even if db.get_call says False, because PyTgCalls might be out of sync
-            await client.leave_call(chat_id, close=False)
-            await asyncio.sleep(0.3)  # give PyTgCalls a moment to finish leaving
-        except (ConnectionNotFound, exceptions.NotInCallError):
-            pass
-        except Exception as e:
-            logger.debug(f"Error leaving call for ghost stream prevention in {chat_id}: {e}")
-
-        max_retries = 3
+        # IMPORTANT: do not leave/rejoin the voice call for every track.
+        # PyTgCalls.play() is designed to replace the active stream in-place.
+        # Repeated leave_call() -> play() cycles force native ntgcalls teardown
+        # and reinitialization for every song and can retain large native heaps.
+        max_retries = 2
         retry_delay = 1
 
         try:
@@ -156,34 +151,33 @@ class CallPlayer:
                     else:
                         raise
                 except TransportParseException:
-                    # WebRTC transport negotiation failed, VC may have ended
                     if attempt < max_retries - 1:
                         logger.debug(
-                            f"Transport not found for {chat_id}, retrying... (attempt {attempt + 1}/{max_retries})")
+                            f"Transport error for {chat_id}; rebuilding call once (attempt {attempt + 1}/{max_retries})")
                         try:
                             await client.leave_call(chat_id, close=False)
                         except Exception:
                             pass
-                        await asyncio.sleep(retry_delay + 1)
+                        await asyncio.sleep(retry_delay)
                         continue
-                    else:
-                        raise
+                    raise
                 except Exception as e:
                     error_msg = str(e).lower()
-                    if "cannot be initialized more than once" in error_msg or "connection" in error_msg:
-                        if attempt < max_retries - 1:
-                            logger.debug(
-                                f"Connection error for {chat_id}, leaving and retrying... (attempt {attempt + 1}/{max_retries})")
-                            try:
-                                await client.leave_call(chat_id, close=False)
-                                await asyncio.sleep(retry_delay)
-                            except Exception:
-                                pass
-                            continue
-                        else:
-                            raise
-                    else:
-                        raise
+                    recoverable = (
+                        "cannot be initialized more than once" in error_msg
+                        or "connection" in error_msg
+                        or "not in a call" in error_msg
+                    )
+                    if recoverable and attempt < max_retries - 1:
+                        logger.debug(
+                            f"Recoverable call error for {chat_id}; rebuilding call once (attempt {attempt + 1}/{max_retries})")
+                        try:
+                            await client.leave_call(chat_id, close=False)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    raise
 
             if seek_time:
                 media.time = seek_time
@@ -271,8 +265,7 @@ class CallPlayer:
                     media.message_id = sent_photo.id
 
                 try:
-                    asyncio.create_task(
-                        preload.start_preload(chat_id, count=1))
+                    await preload.start_preload(chat_id, count=1)
                 except Exception as e:
                     logger.debug(f"Error starting preload for {chat_id}: {e}")
         except FileNotFoundError:
