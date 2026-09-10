@@ -14,6 +14,7 @@ import ctypes
 import gc
 import logging
 import sys
+import inspect
 from pytgcalls import PyTgCalls
 from pyrogram.types import Message
 from HasiiMusic import db, logger, queue
@@ -39,6 +40,7 @@ class TgCall(PyTgCalls):
         self._pending_transitions = set()
         self._transition_tasks = {}
         self._stopping = set()
+        self._idle_reconcile_task = None
 
         # Components
         self._utils = CallsUtils(self)
@@ -120,42 +122,125 @@ class TgCall(PyTgCalls):
         except Exception as e:
             logger.debug(f"Idle state cleanup failed for {chat_id}: {e}")
 
-    async def reconcile_idle_state(self) -> int:
-        """Schedule cleanup for in-memory chat state that is no longer active.
+    async def _native_call_count(self):
+        """Return the total native call count when the binding exposes it.
 
-        This is deliberately conservative: a state entry is considered idle
-        only when MongoDB has no active call, the local queue has no current
-        track, and there is no transition task still running.  Native
-        PyTgCalls state is *not* forcefully manipulated here.
+        A value of None means the installed native binding does not expose a
+        safe count accessor.  Reconciliation remains conservative in that
+        case and will not remove state automatically.
         """
+        total = 0
+        seen = False
+        for client in list(self.clients):
+            binding = getattr(client, "_binding", None)
+            accessor = getattr(binding, "calls", None) if binding is not None else None
+            if not callable(accessor):
+                continue
+            try:
+                result = accessor()
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, int):
+                    total += result
+                    seen = True
+                elif isinstance(result, (dict, list, tuple, set, frozenset)):
+                    total += len(result)
+                    seen = True
+            except Exception:
+                continue
+        return total if seen else None
+
+    async def reconcile_idle_state(self) -> int:
+        """Clean stale per-chat playback state after a session is truly idle.
+
+        The cleanup covers every state map, not only ``_chat_locks``.  It is
+        deliberately conservative: MongoDB must report no active call, the
+        local queue must have no current item, no transition may be running,
+        and the native binding must either report zero calls or be unavailable
+        (in which case no automatic cleanup is performed).
+        """
+        native_count = await self._native_call_count()
+        if native_count is None or native_count > 0:
+            return 0
+
+        state_chats = set(self._chat_locks)
+        state_chats.update(self._session_gen)
+        state_chats.update(self._track_index)
+        state_chats.update(self._transition_tasks)
+        state_chats.update(self._stopping)
+        state_chats.update(self._pending_transitions)
+
         cleaned = 0
-        for chat_id in list(self._chat_locks):
+        for chat_id in list(state_chats):
             try:
                 if chat_id in self._stopping:
                     continue
-                if self._transition_tasks.get(chat_id) is not None:
-                    task = self._transition_tasks.get(chat_id)
-                    if task is not None and not task.done():
-                        continue
+                transition = self._transition_tasks.get(chat_id)
+                if transition is not None and not transition.done():
+                    continue
                 if await db.get_call(chat_id):
                     continue
                 if queue.get_current(chat_id) is not None:
                     continue
+
                 generation = self._session_gen.get(chat_id)
                 if generation is None:
-                    # A lock without a generation is stale by definition.
-                    self._chat_locks.pop(chat_id, None)
-                    self._track_index.pop(chat_id, None)
                     self._pending_transitions.discard(chat_id)
+                    self._track_index.pop(chat_id, None)
+                    self._chat_locks.pop(chat_id, None)
+                    self._transition_tasks.pop(chat_id, None)
+                    self._stopping.discard(chat_id)
                     cleaned += 1
                     continue
-                asyncio.create_task(
-                    self.cleanup_chat_state(chat_id, generation),
-                    name=f"cleanup_idle:{chat_id}",
-                )
+
+                lock = self._chat_locks.get(chat_id)
+                if lock is not None and lock.locked():
+                    continue
+
+                self._pending_transitions.discard(chat_id)
+                self._track_index.pop(chat_id, None)
+                self._session_gen.pop(chat_id, None)
+                self._chat_locks.pop(chat_id, None)
+                self._stopping.discard(chat_id)
+                transition = self._transition_tasks.pop(chat_id, None)
+                if transition is not None and not transition.done():
+                    transition.cancel()
+                cleaned += 1
             except Exception:
                 continue
+
+        if cleaned:
+            await asyncio.to_thread(self.release_idle_memory)
+            logger.info("🧹 Reconciled %d stale idle playback state entries", cleaned)
         return cleaned
+
+    async def _idle_reconcile_loop(self) -> None:
+        """Periodically remove stale state without requiring /stats."""
+        try:
+            while True:
+                await asyncio.sleep(300)
+                await self.reconcile_idle_state()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"Idle reconcile loop stopped: {e}")
+
+    def start_idle_reconciler(self) -> None:
+        if self._idle_reconcile_task is None or self._idle_reconcile_task.done():
+            self._idle_reconcile_task = asyncio.create_task(
+                self._idle_reconcile_loop(),
+                name="idle_state_reconciler",
+            )
+
+    async def shutdown(self) -> None:
+        task = self._idle_reconcile_task
+        self._idle_reconcile_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     @staticmethod
     def release_idle_memory() -> None:
@@ -171,7 +256,9 @@ class TgCall(PyTgCalls):
             pass
 
     async def boot(self) -> None:
-        return await self._manager.boot()
+        result = await self._manager.boot()
+        self.start_idle_reconciler()
+        return result
 
     async def ping(self) -> float:
         return await self._manager.ping()

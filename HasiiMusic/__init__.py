@@ -112,6 +112,12 @@ async def stop() -> None:
         except Exception:
             pass
     
+    # Stop playback state reconciler before closing clients/connections
+    try:
+        await tune.shutdown()
+    except Exception:
+        pass
+
     # Close all connections
     await app.exit()
     await userbot.exit()
