@@ -122,13 +122,43 @@ class TgCall(PyTgCalls):
         except Exception as e:
             logger.debug(f"Idle state cleanup failed for {chat_id}: {e}")
 
-    async def _native_call_count(self):
-        """Return the total native call count when the binding exposes it.
+    async def _native_call_ids(self):
+        """Return active native chat ids when ntgcalls exposes them.
 
-        A value of None means the installed native binding does not expose a
-        safe count accessor.  Reconciliation remains conservative in that
-        case and will not remove state automatically.
+        ntgcalls 3.x exposes ``calls()`` as a mapping keyed by chat id.
+        Keeping the ids lets us clean stale chats individually even while
+        another group is still playing.  ``None`` means the binding did not
+        expose a usable mapping.
         """
+        active = set()
+        seen = False
+        for client in list(self.clients):
+            binding = getattr(client, "_binding", None)
+            accessor = getattr(binding, "calls", None) if binding is not None else None
+            if not callable(accessor):
+                continue
+            try:
+                result = accessor()
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, dict):
+                    active.update(result.keys())
+                    seen = True
+                elif isinstance(result, (list, tuple, set, frozenset)):
+                    # Some binding builds may return a sequence of chat ids.
+                    active.update(result)
+                    seen = True
+            except Exception:
+                continue
+        return active if seen else None
+
+    async def _native_call_count(self):
+        """Return the total native call count when the binding exposes it."""
+        active = await self._native_call_ids()
+        if active is not None:
+            return len(active)
+
+        # Fallback for bindings that only expose an integer count.
         total = 0
         seen = False
         for client in list(self.clients):
@@ -143,25 +173,78 @@ class TgCall(PyTgCalls):
                 if isinstance(result, int):
                     total += result
                     seen = True
-                elif isinstance(result, (dict, list, tuple, set, frozenset)):
-                    total += len(result)
-                    seen = True
             except Exception:
                 continue
         return total if seen else None
 
-    async def reconcile_idle_state(self) -> int:
-        """Clean stale per-chat playback state after a session is truly idle.
+    def _native_cached_chat_ids(self):
+        """Collect PyTgCalls internal cache keys for stale-cache cleanup."""
+        cached = set()
+        attrs = (
+            "_call_sources",
+            "_wait_connect",
+            "_p2p_configs",
+            "_pending_connections",
+            "_need_unmute",
+            "_presentations",
+            "_cache_user_peer",
+        )
+        for client in list(self.clients):
+            for attr in attrs:
+                value = getattr(client, attr, None)
+                if isinstance(value, dict):
+                    cached.update(value.keys())
+                elif isinstance(value, (set, list, tuple, frozenset)):
+                    cached.update(value)
+        return cached
 
-        The cleanup covers every state map, not only ``_chat_locks``.  It is
-        deliberately conservative: MongoDB must report no active call, the
-        local queue must have no current item, no transition may be running,
-        and the native binding must either report zero calls or be unavailable
-        (in which case no automatic cleanup is performed).
+    async def _clear_native_idle_chat(self, chat_id: int, active_ids) -> bool:
+        """Clear PyTgCalls/ntgcalls state for one chat known to be idle.
+
+        This is deliberately per-chat.  It never recreates a whole PyTgCalls
+        client and therefore cannot interrupt unrelated active groups.
         """
-        native_count = await self._native_call_count()
-        if native_count is None or native_count > 0:
-            return 0
+        if active_ids is None or chat_id in active_ids:
+            return False
+
+        cleared = False
+        for client in list(self.clients):
+            # ``_clear_call`` is the native stack's own internal cleanup path:
+            # it stops the native chat (ignoring ConnectionNotFound) and then
+            # clears _call_sources/_wait_connect/_p2p_configs/etc.
+            clear_call = getattr(client, "_clear_call", None)
+            if callable(clear_call):
+                try:
+                    await clear_call(chat_id)
+                    cleared = True
+                    continue
+                except Exception:
+                    pass
+
+            # Compatibility fallback for builds without _clear_call.
+            leave_call = getattr(client, "leave_call", None)
+            if callable(leave_call):
+                try:
+                    await leave_call(chat_id, close=False)
+                    cleared = True
+                except Exception:
+                    pass
+        return cleared
+
+    async def reconcile_idle_state(self) -> int:
+        """Reconcile stale Python *and native* state on a per-chat basis.
+
+        V10 waited for the whole native client to reach zero calls before
+        cleaning anything.  That is safe but leaves stale state around while
+        another group is playing.  V11 uses ntgcalls' chat-id mapping instead:
+        active chats are protected, while idle chats are cleaned individually.
+        """
+        active_ids = await self._native_call_ids()
+        if active_ids is None:
+            # Unknown native ownership: retain V10's conservative behavior.
+            native_count = await self._native_call_count()
+            if native_count is None or native_count > 0:
+                return 0
 
         state_chats = set(self._chat_locks)
         state_chats.update(self._session_gen)
@@ -169,10 +252,14 @@ class TgCall(PyTgCalls):
         state_chats.update(self._transition_tasks)
         state_chats.update(self._stopping)
         state_chats.update(self._pending_transitions)
+        state_chats.update(self._native_cached_chat_ids())
 
         cleaned = 0
+        native_cleaned = 0
         for chat_id in list(state_chats):
             try:
+                if active_ids is not None and chat_id in active_ids:
+                    continue
                 if chat_id in self._stopping:
                     continue
                 transition = self._transition_tasks.get(chat_id)
@@ -183,19 +270,16 @@ class TgCall(PyTgCalls):
                 if queue.get_current(chat_id) is not None:
                     continue
 
-                generation = self._session_gen.get(chat_id)
-                if generation is None:
-                    self._pending_transitions.discard(chat_id)
-                    self._track_index.pop(chat_id, None)
-                    self._chat_locks.pop(chat_id, None)
-                    self._transition_tasks.pop(chat_id, None)
-                    self._stopping.discard(chat_id)
-                    cleaned += 1
-                    continue
-
                 lock = self._chat_locks.get(chat_id)
                 if lock is not None and lock.locked():
                     continue
+
+                # First release the native per-chat caches. This is important
+                # because Python-side state can be empty while PyTgCalls still
+                # holds call sources/peers for an old chat.
+                if active_ids is not None:
+                    if await self._clear_native_idle_chat(chat_id, active_ids):
+                        native_cleaned += 1
 
                 self._pending_transitions.discard(chat_id)
                 self._track_index.pop(chat_id, None)
@@ -209,10 +293,15 @@ class TgCall(PyTgCalls):
             except Exception:
                 continue
 
-        if cleaned:
+        if cleaned or native_cleaned:
             await asyncio.to_thread(self.release_idle_memory)
-            logger.info("🧹 Reconciled %d stale idle playback state entries", cleaned)
-        return cleaned
+            logger.info(
+                "🧹 V11 idle reconciliation: python=%d native=%d active_native=%s",
+                cleaned,
+                native_cleaned,
+                sorted(active_ids) if active_ids is not None else "unknown",
+            )
+        return cleaned + native_cleaned
 
     async def _idle_reconcile_loop(self) -> None:
         """Periodically remove stale state without requiring /stats."""
