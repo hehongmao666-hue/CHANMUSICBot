@@ -207,6 +207,46 @@ def _format_mb(value):
     return f"{value / (1024 ** 2):.1f}MB"
 
 
+def _read_proc_maps_summary():
+    """Summarize large anonymous/file-backed mappings from /proc/self/maps.
+
+    This is intentionally an aggregate pass over the maps file, not a full
+    smaps walk. It helps distinguish mmap-heavy native allocations from the
+    normal glibc arena without materially changing the bot heap.
+    """
+    anonymous = 0
+    file_backed = 0
+    large_anon = []
+    try:
+        with open("/proc/self/maps", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split(None, 5)
+                if not parts:
+                    continue
+                try:
+                    start, end = (int(x, 16) for x in parts[0].split("-", 1))
+                    size = end - start
+                except (ValueError, IndexError):
+                    continue
+                path = parts[5].strip() if len(parts) >= 6 else ""
+                if not path or path.startswith("[anon") or path.startswith("[heap"):
+                    anonymous += size
+                    if size >= 16 * 1024 * 1024:
+                        large_anon.append(size)
+                else:
+                    file_backed += size
+    except OSError:
+        return None
+
+    large_anon.sort(reverse=True)
+    return {
+        "anonymous": anonymous,
+        "file_backed": file_backed,
+        "large_anon_count": len(large_anon),
+        "large_anon_top": large_anon[:10],
+    }
+
+
 def _get_malloc_stats():
     """Return glibc allocator totals when available."""
     try:
@@ -304,12 +344,18 @@ async def _native_call_diagnostics():
                     result = accessor()
                     if inspect.isawaitable(result):
                         result = await result
-                    size = _safe_size(result)
-                    logger.info(
-                        "NATIVE binding.calls CLIENT %d: %s",
-                        index,
-                        size if size is not None else "present",
-                    )
+                    if isinstance(result, dict):
+                        logger.info(
+                            "NATIVE binding.calls CLIENT %d: count=%d ids=%s",
+                            index, len(result), sorted(result.keys()),
+                        )
+                    else:
+                        size = _safe_size(result)
+                        logger.info(
+                            "NATIVE binding.calls CLIENT %d: %s",
+                            index,
+                            size if size is not None else "present",
+                        )
             except Exception as e:
                 logger.debug("Native calls() diagnostic unavailable for client %d: %s", index, e)
 
@@ -392,6 +438,17 @@ async def _memory_diagnostic_snapshot():
         task_total, task_states, task_object_count, gc_garbage_count,
     )
     logger.info("Asyncio task names: %s", task_names)
+
+    maps = _read_proc_maps_summary()
+    if maps is not None:
+        top_maps = ", ".join(_format_mb(v) for v in maps["large_anon_top"]) or "none"
+        logger.info(
+            "Proc maps: anonymous=%s | file_backed=%s | large_anon_mappings=%d | top=%s",
+            _format_mb(maps["anonymous"]),
+            _format_mb(maps["file_backed"]),
+            maps["large_anon_count"],
+            top_maps,
+        )
 
     malloc_info = _get_malloc_stats()
     if malloc_info is not None:

@@ -19,6 +19,7 @@ from pyrogram.types import Message
 from pytgcalls import exceptions, types
 
 from HasiiMusic import app, config, db, lang, logger, preload
+from HasiiMusic.core.calls.diagnostics import log_call_lifecycle_snapshot
 from HasiiMusic.helpers import Media, Track, buttons, thumb
 
 class CallPlayer:
@@ -130,6 +131,7 @@ class CallPlayer:
         retry_delay = 1
 
         try:
+            await log_call_lifecycle_snapshot("BEFORE_PLAY", client, chat_id)
             for attempt in range(max_retries):
                 try:
                     await client.play(
@@ -137,6 +139,7 @@ class CallPlayer:
                         stream=stream,
                         config=types.GroupCallConfig(auto_start=True),
                     )
+                    await log_call_lifecycle_snapshot("AFTER_PLAY", client, chat_id)
                     break
                 except (exceptions.NoActiveGroupCall, errors.RPCError) as e:
                     error_msg = str(e)
@@ -329,7 +332,9 @@ class CallPlayer:
             error_msg = str(e)
             logger.warning(
                 f"⏱️ Timeout joining voice chat {chat_id}: {error_msg}")
+            await log_call_lifecycle_snapshot("JOIN_TIMEOUT_BEFORE_STOP", client, chat_id)
             await self.controller._controls._stop_impl(chat_id)
+            await log_call_lifecycle_snapshot("JOIN_TIMEOUT_AFTER_STOP", client, chat_id)
             if message:
                 try:
                     await message.edit_text(
