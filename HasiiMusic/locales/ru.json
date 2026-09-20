@@ -71,7 +71,7 @@
   "logger_usage": "<blockquote><b>Использование:</b>\n\n/{0} [on|off]</blockquote>",
   "not_playing": "Бот ничего не транслирует в голосовой чат.",
   "pinging": "<blockquote>Пингование… Пожалуйста, подождите…</blockquote>",
-  "ping_pong": "<b>HASII ꭙ MUSIC, Продвинутый музыкальный бот Telegram!</b>\n\n<b><ul>Статус бота<ul></b>\n\n<blockquote>✅ <b>В сети и транслирует</b>\n   ● Задержка: <code>{0}мс</code>\n   ● Время работы: <code>{1}</code>\n   ● PyTgCalls: <code>{2}мс</code>\n   ● ОЗУ: <code>{3}</code>\n   ● ЦП: <code>{4}%</code></blockquote>",
+  "ping_pong": "<b>{bot_name}, Продвинутый музыкальный бот Telegram!</b>\n\n<b><ul>Статус бота<ul></b>\n\n<blockquote>✅ <b>В сети и транслирует</b>\n   ● Задержка: <code>{latency}мс</code>\n   ● Время работы: <code>{uptime}</code>\n   ● PyTgCalls: <code>{pytgcalls_ping}мс</code>\n   ● ОЗУ: <code>{ram_usage}</code>\n   ● ЦП: <code>{cpu_percent}%</code>\n   ● Активные чаты: <code>{active_chats}</code></blockquote>",
   "play_admin": "<blockquote><u><b>Только для администраторов</b></u>\n\nТолько администраторам разрешено включать музыку в этом чате.</blockquote>",
   "play_banned": "<blockquote><u><b>Помощник {0} забанен в вашем чате</b></u>\n\n<b>ID:</b> <code>{1}</code>\n<b>Имя:</b> {2}\n<b>Username:</b> {3}</blockquote>",
   "play_media": "<blockquote>🔴 <b>Запрошенный стрим запущен</b></blockquote>\n<blockquote>➤ <b>Название :</b> <a href={0}>{1}</a>\n➤ <b>Длительность :</b> {2} минут\n➤ <b>Запросил :</b> {3}</blockquote>",

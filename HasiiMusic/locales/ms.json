@@ -71,7 +71,7 @@
   "logger_usage": "<blockquote><b>Penggunaan:</b>\n\n/{0} [on|off]</blockquote>",
   "not_playing": "Bot tidak memainkan sebarang strim di chat suara.",
   "pinging": "<blockquote>Pinging… Sila tunggu…</blockquote>",
-  "ping_pong": "<b>HASII ꭙ MUSIC, Bot Muzik Telegram Lanjutan!</b>\n\n<b><ul>Status Bot<ul></b>\n\n<blockquote>✅ <b>Dalam Talian & Penstriman</b>\n   ● Kependaman: <code>{0}ms</code>\n   ● Masa Aktif: <code>{1}</code>\n   ● PyTgCalls: <code>{2}ms</code>\n   ● RAM: <code>{3}</code>\n   ● CPU: <code>{4}%</code></blockquote>",
+  "ping_pong": "<b>{bot_name}, Bot Muzik Telegram Lanjutan!</b>\n\n<b><ul>Status Bot<ul></b>\n\n<blockquote>✅ <b>Dalam Talian & Penstriman</b>\n   ● Kependaman: <code>{latency}ms</code>\n   ● Masa Aktif: <code>{uptime}</code>\n   ● PyTgCalls: <code>{pytgcalls_ping}ms</code>\n   ● RAM: <code>{ram_usage}</code>\n   ● CPU: <code>{cpu_percent}%</code>\n   ● Chat Aktif: <code>{active_chats}</code></blockquote>",
   "play_admin": "<blockquote><u><b>Admin Sahaja (Admin Only Play)</b></u>\n\nHanya admin yang dibenarkan untuk mainkan di grup ini.</blockquote>",
   "play_banned": "<blockquote><u><b>Pembantu {0} diharamkan dari grup anda</b></u>\n\n<b>ID:</b> <code>{1}</code>\n<b>Nama:</b> {2}\n<b>Username:</b> {3}</blockquote>",
   "play_media": "<blockquote>🔴 <b>Strim yang diminta telah bermula</b></blockquote>\n<blockquote>➤ <b>Tajuk :</b> <a href={0}>{1}</a>\n➤ <b>Masa :</b> {2} minit\n➤ <b>Diminta oleh :</b> {3}</blockquote>",

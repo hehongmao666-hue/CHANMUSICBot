@@ -72,7 +72,7 @@
   "logger_usage": "<blockquote><b>使用方法：</b>\n\n/{0} [on|off]</blockquote>",
   "not_playing": "机器人未在语音聊天中播放。",
   "pinging": "<blockquote>正在 Ping... 请稍候...</blockquote>",
-  "ping_pong": "<b>Hasii X Music，先进的 Telegram 音乐流媒体机器人。体验录音室品质的音频流！</b>\n\n<b><ul>机器人状态<ul></b>\n\n<blockquote>✅ <b>在线 & 播放中</b>\n   ● 延迟：<code>{0}ms</code>\n   ● 运行时间：<code>{1}</code>\n   ● PyTgCalls：<code>{2}ms</code>\n   ● 内存：<code>{3}</code>\n   ● CPU：<code>{4}%</code></blockquote>\n\n<blockquote><b>⚡ 功能特色</b>\n   ● 水晶般清晰的 Opus 音频\n   ● 在线电台（50+ 个电台）\n   ● 智能队列（30+ 首歌曲）\n   ● 闪电般快速播放\n   ● 高级管理员控制\n   ● 多助手支持\n   ● 自动队列管理</blockquote>\n\n<blockquote><b>🚀 通过 CI/CD 部署</b></blockquote>",
+  "ping_pong": "<b>{bot_name}，先进的 Telegram 音乐流媒体机器人。体验录音室品质的音频流！</b>\n\n<b><ul>机器人状态<ul></b>\n\n<blockquote>✅ <b>在线 & 播放中</b>\n   ● 延迟：<code>{latency}ms</code>\n   ● 运行时间：<code>{uptime}</code>\n   ● PyTgCalls：<code>{pytgcalls_ping}ms</code>\n   ● 内存：<code>{ram_usage}</code>\n   ● CPU：<code>{cpu_percent}%</code>\n   ● 活跃群组：<code>{active_chats}</code></blockquote>\n\n<blockquote><b>⚡ 功能特色</b>\n   ● 水晶般清晰的 Opus 音频\n   ● 在线电台（50+ 个电台）\n   ● 智能队列（30+ 首歌曲）\n   ● 闪电般快速播放\n   ● 高级管理员控制\n   ● 多助手支持\n   ● 自动队列管理</blockquote>\n\n<blockquote><b>🚀 通过 CI/CD 部署</b></blockquote>",
   "play_admin": "<blockquote><u><b>仅限管理员播放</b></u>\n\n只有管理员才能在此群组中播放音乐。</blockquote>",
   "play_banned": "<blockquote><u><b>{0} 助手已被您的群组封禁</b></u>\n\n<b>ID：</b> <code>{1}</code>\n<b>姓名：</b> {2}\n<b>用户名：</b> {3}</blockquote>",
   "play_media": "<blockquote>🔴 <b>已开始播放请求的流媒体</b></blockquote>\n<blockquote>➤ <b>标题：</b> <a href={0}>{1}</a>\n➤ <b>时长：</b> {2} 分钟\n➤ <b>请求者：</b> {3}</blockquote>",
