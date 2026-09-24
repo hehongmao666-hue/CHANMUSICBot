@@ -97,11 +97,33 @@ class CallControls:
             logger.warning(f"Error clearing queue/call for {chat_id}: {e}")
 
         try:
-            await log_call_lifecycle_snapshot("BEFORE_LEAVE", client, chat_id)
-            await client.leave_call(chat_id, close=False)
-            await log_call_lifecycle_snapshot("AFTER_LEAVE", client, chat_id)
-            # Small delay to let group call state stabilize after leaving
-            await asyncio.sleep(0.5)
+            native_ids = await self.controller._native_call_ids()
+
+            if native_ids is not None and chat_id not in native_ids:
+                logger.debug(
+                    f"Skip leave_call for inactive chat {chat_id}; "
+                    f"native_calls={sorted(native_ids)}"
+                )
+            else:
+                await log_call_lifecycle_snapshot(
+                    "BEFORE_LEAVE",
+                    client,
+                    chat_id,
+                )
+
+                await client.leave_call(
+                    chat_id,
+                    close=False,
+                )
+
+                await log_call_lifecycle_snapshot(
+                    "AFTER_LEAVE",
+                    client,
+                    chat_id,
+                )
+
+                await asyncio.sleep(0.5)
+
         except (ConnectionNotFound, exceptions.NotInCallError):
             # the userbot is already out of the call
             pass

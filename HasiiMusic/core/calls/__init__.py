@@ -221,14 +221,11 @@ class TgCall(PyTgCalls):
                 except Exception:
                     pass
 
-            # Compatibility fallback for builds without _clear_call.
-            leave_call = getattr(client, "leave_call", None)
-            if callable(leave_call):
-                try:
-                    await leave_call(chat_id, close=False)
-                    cleared = True
-                except Exception:
-                    pass
+            # Do NOT call public leave_call() here.
+            # This chat is already confirmed absent from native active calls.
+            # Calling leave_call() can trigger the normal stop/cleanup flow
+            # again and produce repeated BEFORE_LEAVE events.
+
         return cleared
 
     async def reconcile_idle_state(self) -> int:
