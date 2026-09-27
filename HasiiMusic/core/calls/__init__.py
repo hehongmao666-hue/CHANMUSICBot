@@ -17,7 +17,7 @@ import sys
 import inspect
 from pytgcalls import PyTgCalls
 from pyrogram.types import Message
-from HasiiMusic import db, logger, queue
+from HasiiMusic import app, db, logger, queue
 from HasiiMusic.helpers import Media, Track
 
 from .utils import CallsUtils, PyTgCallsErrorFilter
@@ -41,6 +41,8 @@ class TgCall(PyTgCalls):
         self._transition_tasks = {}
         self._stopping = set()
         self._idle_reconcile_task = None
+        self._vc_watchdog_task = None
+        self._vc_recovery_state = {}
 
         # Components
         self._utils = CallsUtils(self)
@@ -300,6 +302,190 @@ class TgCall(PyTgCalls):
             )
         return cleaned + native_cleaned
 
+    async def _recover_ghost_chat(self, chat_id: int):
+        """Recover one chat whose Python playback state is alive but native VC is gone.
+
+        Returns:
+            True  -> recovered / already recovered
+            False -> recovery attempted but did not restore native VC
+            None  -> skipped because another operation currently owns the chat lock
+        """
+        if chat_id in self._stopping:
+            return False
+
+        lock = self.get_lock(chat_id)
+        if lock.locked():
+            return None
+
+        async with lock:
+            if chat_id in self._stopping:
+                return False
+            if not await db.get_call(chat_id):
+                return False
+            try:
+                if not await db.playing(chat_id):
+                    return False
+            except (KeyError, TypeError):
+                return False
+
+            active_ids = await self._native_call_ids()
+            if active_ids is None:
+                return False
+            if chat_id in active_ids:
+                return True
+
+            media = queue.get_current(chat_id)
+            if media is None:
+                logger.warning(
+                    f"👻 Ghost VC has no current media; leaving state untouched for {chat_id}"
+                )
+                return False
+
+            if not getattr(media, "file_path", None):
+                logger.warning(
+                    f"👻 Ghost VC current media has no file_path for {chat_id}; "
+                    "waiting for the normal queue/download path"
+                )
+                return False
+
+            # Reuse the current media and approximate playback position.
+            # Do not start a new session: this is recovery of the existing one.
+            seek_time = max(1, int(getattr(media, "time", 1) or 1))
+            message = None
+            message_id = getattr(media, "message_id", None)
+            if message_id:
+                try:
+                    message = await app.get_messages(chat_id, message_id)
+                except Exception:
+                    message = None
+
+            logger.warning(
+                f"🔄 Recovering Ghost VC for {chat_id} from ~{seek_time}s"
+            )
+
+            await self._player._play_media_impl(
+                chat_id,
+                message,
+                media,
+                seek_time=seek_time,
+                recovery=True,
+            )
+
+            await asyncio.sleep(0.75)
+            active_after = await self._native_call_ids()
+            if active_after is not None and chat_id in active_after:
+                try:
+                    from HasiiMusic import preload
+                    await preload.start_preload(chat_id, count=1)
+                except Exception as e:
+                    logger.debug(
+                        f"Ghost VC preload failed for {chat_id}: {e}"
+                    )
+                logger.info(f"✅ Ghost VC recovered for {chat_id}")
+                return True
+
+            logger.warning(
+                f"⚠️ Ghost VC recovery did not restore native call for {chat_id}; "
+                f"native_calls={sorted(active_after) if active_after is not None else 'unknown'}"
+            )
+            return False
+
+    async def _vc_watchdog_loop(self) -> None:
+        """Detect active playback whose native voice call disappeared.
+
+        This is intentionally separate from idle reconciliation: a chat with
+        an active DB playback record is *not* idle and therefore must be
+        recovered rather than cleaned.
+        """
+        try:
+            while True:
+                await asyncio.sleep(10)
+
+                active_ids = await self._native_call_ids()
+                if active_ids is None:
+                    continue
+
+                active_calls = getattr(db, "active_calls", {})
+                for chat_id in list(active_calls.keys()):
+                    try:
+                        if chat_id in self._stopping:
+                            self._vc_recovery_state.pop(chat_id, None)
+                            continue
+
+                        if not await db.get_call(chat_id):
+                            self._vc_recovery_state.pop(chat_id, None)
+                            continue
+
+                        if not await db.playing(chat_id):
+                            # Paused playback is intentionally not auto-rejoined.
+                            self._vc_recovery_state.pop(chat_id, None)
+                            continue
+
+                        if queue.get_current(chat_id) is None:
+                            self._vc_recovery_state.pop(chat_id, None)
+                            continue
+
+                        if chat_id in active_ids:
+                            if chat_id in self._vc_recovery_state:
+                                logger.info(
+                                    f"✅ VC watchdog cleared recovery state for {chat_id}"
+                                )
+                            self._vc_recovery_state.pop(chat_id, None)
+                            continue
+
+                        loop = asyncio.get_running_loop()
+                        now = loop.time()
+                        state = self._vc_recovery_state.setdefault(
+                            chat_id,
+                            {"missing": 0, "attempts": 0, "next_at": 0.0},
+                        )
+                        state["missing"] += 1
+
+                        if state["missing"] == 1:
+                            logger.warning(
+                                f"👻 Ghost VC detected for {chat_id}; "
+                                "waiting for one more confirmation"
+                            )
+                            continue
+
+                        if now < state["next_at"]:
+                            continue
+
+                        result = await self._recover_ghost_chat(chat_id)
+                        if result is None:
+                            continue
+
+                        if result:
+                            self._vc_recovery_state.pop(chat_id, None)
+                            continue
+
+                        state["attempts"] += 1
+                        # 5s, 10s, 20s, 40s, then cap at 60s.
+                        delay = min(60, 5 * (2 ** min(state["attempts"] - 1, 4)))
+                        state["next_at"] = now + delay
+                        logger.warning(
+                            f"⏳ Ghost VC recovery retry scheduled for {chat_id} "
+                            f"in {delay}s (attempt={state['attempts']})"
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.debug(
+                            f"VC watchdog check failed for {chat_id}: {e}"
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"VC watchdog stopped unexpectedly: {e}", exc_info=True)
+
+    def start_vc_watchdog(self) -> None:
+        if self._vc_watchdog_task is None or self._vc_watchdog_task.done():
+            self._vc_watchdog_task = asyncio.create_task(
+                self._vc_watchdog_loop(),
+                name="vc_ghost_watchdog",
+            )
+            logger.info("🛡️ VC Ghost Watchdog started (10s interval)")
+
     async def _idle_reconcile_loop(self) -> None:
         """Periodically remove stale state without requiring /stats."""
         try:
@@ -319,6 +505,17 @@ class TgCall(PyTgCalls):
             )
 
     async def shutdown(self) -> None:
+        watchdog = self._vc_watchdog_task
+        self._vc_watchdog_task = None
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
+            try:
+                await watchdog
+            except asyncio.CancelledError:
+                pass
+
+        self._vc_recovery_state.clear()
+
         task = self._idle_reconcile_task
         self._idle_reconcile_task = None
         if task is not None and not task.done():
@@ -344,6 +541,7 @@ class TgCall(PyTgCalls):
     async def boot(self) -> None:
         result = await self._manager.boot()
         self.start_idle_reconciler()
+        self.start_vc_watchdog()
         return result
 
     async def ping(self) -> float:

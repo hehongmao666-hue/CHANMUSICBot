@@ -45,6 +45,7 @@ class CallPlayer:
         message: Message | None,
         media: Media | Track,
         seek_time: int = 0,
+        recovery: bool = False,
     ) -> None:
         """Play media in voice chat.
 
@@ -53,6 +54,7 @@ class CallPlayer:
             message: Message to edit/delete (if any)
             media: Media object to play
             seek_time: Position to seek to (seconds)
+            recovery: Recover an existing playback session without clearing its state.
         """
         client = await db.get_assistant(chat_id)
         _lang = await lang.get_lang(chat_id)
@@ -127,11 +129,12 @@ class CallPlayer:
         # PyTgCalls.play() is designed to replace the active stream in-place.
         # Repeated leave_call() -> play() cycles force native ntgcalls teardown
         # and reinitialization for every song and can retain large native heaps.
-        max_retries = 2
+        max_retries = 3
         retry_delay = 1
 
         try:
             await log_call_lifecycle_snapshot("BEFORE_PLAY", client, chat_id)
+
             for attempt in range(max_retries):
                 try:
                     await client.play(
@@ -141,45 +144,164 @@ class CallPlayer:
                     )
                     await log_call_lifecycle_snapshot("AFTER_PLAY", client, chat_id)
                     break
+
                 except (exceptions.NoActiveGroupCall, errors.RPCError) as e:
                     error_msg = str(e)
-                    if "GROUPCALL_INVALID" in error_msg or "GROUPCALL" in error_msg or isinstance(e, exceptions.NoActiveGroupCall):
+
+                    if (
+                        "GROUPCALL_INVALID" in error_msg
+                        or "GROUPCALL" in error_msg
+                        or isinstance(e, exceptions.NoActiveGroupCall)
+                    ):
                         if attempt < max_retries - 1:
-                            logger.debug(
-                                f"Group call transitioning for {chat_id}, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
-                            await asyncio.sleep(retry_delay)
+                            delay = retry_delay * (attempt + 1)
+                            logger.warning(
+                                f"Group call transitioning for {chat_id}; "
+                                f"retry {attempt + 2}/{max_retries} in {delay}s"
+                            )
+                            await asyncio.sleep(delay)
                             continue
-                        else:
-                            raise
-                    else:
                         raise
+
+                    raise
+
                 except TransportParseException:
                     if attempt < max_retries - 1:
-                        logger.debug(
-                            f"Transport error for {chat_id}; rebuilding call once (attempt {attempt + 1}/{max_retries})")
+                        delay = retry_delay * (attempt + 1)
+
+                        logger.warning(
+                            f"Transport error for {chat_id}; rebuilding "
+                            f"current chat only "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+
                         try:
-                            await client.leave_call(chat_id, close=False)
+                            await log_call_lifecycle_snapshot(
+                                "BEFORE_LEAVE",
+                                client,
+                                chat_id,
+                            )
                         except Exception:
                             pass
-                        await asyncio.sleep(retry_delay)
+
+                        try:
+                            await client.leave_call(chat_id, close=False)
+                        except Exception as e:
+                            logger.debug(
+                                f"Transport recovery leave failed "
+                                f"for {chat_id}: {e}"
+                            )
+
+                        try:
+                            await log_call_lifecycle_snapshot(
+                                "AFTER_LEAVE",
+                                client,
+                                chat_id,
+                            )
+                        except Exception:
+                            pass
+
+                        await asyncio.sleep(delay)
                         continue
+
                     raise
+
+                except TimeoutError as e:
+                    if attempt < max_retries - 1:
+                        delay = retry_delay * (attempt + 1)
+
+                        logger.warning(
+                            f"Voice chat timeout for {chat_id}; "
+                            f"retry {attempt + 2}/{max_retries} in {delay}s"
+                        )
+
+                        try:
+                            await log_call_lifecycle_snapshot(
+                                "JOIN_TIMEOUT",
+                                client,
+                                chat_id,
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            await log_call_lifecycle_snapshot(
+                                "BEFORE_LEAVE",
+                                client,
+                                chat_id,
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            await client.leave_call(chat_id, close=False)
+                        except Exception as leave_error:
+                            logger.debug(
+                                f"Timeout recovery leave failed "
+                                f"for {chat_id}: {leave_error}"
+                            )
+
+                        try:
+                            await log_call_lifecycle_snapshot(
+                                "AFTER_LEAVE",
+                                client,
+                                chat_id,
+                            )
+                        except Exception:
+                            pass
+
+                        await asyncio.sleep(delay)
+                        continue
+
+                    raise
+
                 except Exception as e:
                     error_msg = str(e).lower()
                     recoverable = (
                         "cannot be initialized more than once" in error_msg
                         or "connection" in error_msg
                         or "not in a call" in error_msg
+                        or "transport" in error_msg
                     )
+
                     if recoverable and attempt < max_retries - 1:
-                        logger.debug(
-                            f"Recoverable call error for {chat_id}; rebuilding call once (attempt {attempt + 1}/{max_retries})")
+                        delay = retry_delay * (attempt + 1)
+
+                        logger.warning(
+                            f"Recoverable call error for {chat_id}; "
+                            f"rebuilding current chat only "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+
                         try:
-                            await client.leave_call(chat_id, close=False)
+                            await log_call_lifecycle_snapshot(
+                                "BEFORE_LEAVE",
+                                client,
+                                chat_id,
+                            )
                         except Exception:
                             pass
-                        await asyncio.sleep(retry_delay)
+
+                        try:
+                            await client.leave_call(chat_id, close=False)
+                        except Exception as leave_error:
+                            logger.debug(
+                                f"Recoverable cleanup failed "
+                                f"for {chat_id}: {leave_error}"
+                            )
+
+                        try:
+                            await log_call_lifecycle_snapshot(
+                                "AFTER_LEAVE",
+                                client,
+                                chat_id,
+                            )
+                        except Exception:
+                            pass
+
+                        await asyncio.sleep(delay)
                         continue
+
                     raise
 
             if seek_time:
@@ -272,6 +394,9 @@ class CallPlayer:
                 except Exception as e:
                     logger.debug(f"Error starting preload for {chat_id}: {e}")
         except FileNotFoundError:
+            if recovery:
+                logger.warning(f"⚠️ Recovery file disappeared for {chat_id}")
+                return
             if message:
                 try:
                     await message.edit_text(_lang["error_no_file"].format(config.SUPPORT_CHAT))
@@ -279,6 +404,9 @@ class CallPlayer:
                     pass
             await self.controller._queue._play_next_impl(chat_id)
         except exceptions.NoActiveGroupCall:
+            if recovery:
+                logger.warning(f"⚠️ Recovery found no active group call for {chat_id}")
+                return
             await self.controller._controls._stop_impl(chat_id)
             if message:
                 try:
@@ -287,6 +415,10 @@ class CallPlayer:
                     pass
         except errors.RPCError as e:
             error_str = str(e)
+
+            if recovery:
+                logger.warning(f"⚠️ Recovery RPC error for {chat_id}: {e}")
+                return
 
             if any(x in error_str for x in ["CHAT_ADMIN_REQUIRED", "phone.CreateGroupCall", "GROUPCALL_FORBIDDEN", "GROUPCALL_CREATE_FORBIDDEN", "VOICE_MESSAGES_FORBIDDEN"]):
                 await self.controller._controls._stop_impl(chat_id)
@@ -306,6 +438,9 @@ class CallPlayer:
                 logger.error(f"RPC error in play_media for {chat_id}: {e}")
                 await self.controller._controls._stop_impl(chat_id)
         except exceptions.NoAudioSourceFound:
+            if recovery:
+                logger.warning(f"⚠️ Recovery found no audio source for {chat_id}")
+                return
             if message:
                 try:
                     await message.edit_text(_lang["error_no_audio"])
@@ -313,8 +448,11 @@ class CallPlayer:
                     pass
             await self.controller._queue._play_next_impl(chat_id)
         except TransportParseException:
-            # all retries failed, so the voice chat is probably gone
-            logger.warning(f"Transport not found for {chat_id} after retries, stopping.")
+            # all retries failed; during watchdog recovery keep the existing
+            # Python playback state so a later watchdog pass can retry.
+            logger.warning(f"Transport not found for {chat_id} after retries.")
+            if recovery:
+                return
             await self.controller._controls._stop_impl(chat_id)
             if message:
                 try:
@@ -322,6 +460,9 @@ class CallPlayer:
                 except Exception:
                     pass
         except (ConnectionNotFound, TelegramServerError):
+            if recovery:
+                logger.warning(f"⚠️ Recovery Telegram/native connection error for {chat_id}")
+                return
             await self.controller._controls._stop_impl(chat_id)
             if message:
                 try:
@@ -331,10 +472,21 @@ class CallPlayer:
         except TimeoutError as e:
             error_msg = str(e)
             logger.warning(
-                f"⏱️ Timeout joining voice chat {chat_id}: {error_msg}")
-            await log_call_lifecycle_snapshot("JOIN_TIMEOUT_BEFORE_STOP", client, chat_id)
+                f"⏱️ Timeout joining voice chat {chat_id} after {max_retries} attempts: {error_msg}")
+            if recovery:
+                logger.warning(f"⏳ Keeping Ghost VC session alive for a later retry: {chat_id}")
+                return
+            await log_call_lifecycle_snapshot(
+                "JOIN_TIMEOUT_FINAL_BEFORE_STOP",
+                client,
+                chat_id,
+            )
             await self.controller._controls._stop_impl(chat_id)
-            await log_call_lifecycle_snapshot("JOIN_TIMEOUT_AFTER_STOP", client, chat_id)
+            await log_call_lifecycle_snapshot(
+                "JOIN_TIMEOUT_FINAL_AFTER_STOP",
+                client,
+                chat_id,
+            )
             if message:
                 try:
                     await message.edit_text(
@@ -348,6 +500,8 @@ class CallPlayer:
         except Exception as e:
             logger.error(
                 f"Unexpected error in play_media for {chat_id}: {e}", exc_info=True)
+            if recovery:
+                return
             await self.controller._controls._stop_impl(chat_id)
             if message:
                 try:

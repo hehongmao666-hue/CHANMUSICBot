@@ -20,6 +20,7 @@ class Searcher:
     def __init__(self, cookies_manager):
         self._cookies = cookies_manager
         self.search_cache = {}  # {"query_video": (result, timestamp)}
+        self._candidate_cache = {}  # {first_video_id: [fallback_video_ids]}
 
     def valid(self, url: str) -> bool:
         # Re-using the regex from utils - or we can just assume caller knows
@@ -148,7 +149,7 @@ class Searcher:
 
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         return ydl.extract_info(
-                            f"ytsearch1:{query}",
+                            f"ytsearch5:{query}",
                             download=False
                         )
 
@@ -163,7 +164,16 @@ class Searcher:
                 ):
                     return None
 
-                data = results["entries"][0]
+                entries = [e for e in results["entries"] if e and e.get("id")]
+                if not entries:
+                    return None
+
+                data = entries[0]
+                self._candidate_cache[data.get("id")] = [
+                    e.get("id") for e in entries[1:] if e.get("id")
+                ]
+                if len(self._candidate_cache) > 200:
+                    self._candidate_cache.pop(next(iter(self._candidate_cache)), None)
 
                 duration_sec = data.get("duration")
                 is_live = data.get("is_live", False)
@@ -227,6 +237,10 @@ class Searcher:
                 f"⚠️ YouTube search failed for '{query}': {e}"
             )
             return None
+
+    def alternatives(self, video_id: str) -> list[str]:
+        """Return fallback video IDs collected for a search result."""
+        return list(self._candidate_cache.get(video_id, []))
 
     async def playlist(
         self,

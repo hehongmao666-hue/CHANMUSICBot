@@ -1,7 +1,8 @@
 # ==============================================================================
-# ping.py - System Ping
+# ping.py - System Ping + Chat ID Diagnostic
 # ==============================================================================
 # Check bot latency and server metrics like CPU/RAM usage.
+# Also provides /id to diagnose Telegram chat ID.
 # ==============================================================================
 
 import time
@@ -12,6 +13,45 @@ from pyrogram import filters, types
 from HasiiMusic import app, tune, boot, config, lang
 from HasiiMusic.helpers import buttons
 
+
+# ==============================================================================
+# Chat ID Diagnostic
+# ==============================================================================
+
+@app.on_message(filters.command("id") & ~app.bl_users)
+async def chat_id(_, m: types.Message):
+    """Show the current Telegram chat information."""
+
+    chat = m.chat
+
+    chat_title = (
+        getattr(chat, "title", None)
+        or getattr(chat, "first_name", None)
+        or getattr(chat, "username", None)
+        or "Private Chat"
+    )
+
+    username = getattr(chat, "username", None)
+
+    text = (
+        "🔎 <b>Chat Information</b>\n\n"
+        f"🆔 <b>Chat ID:</b> <code>{chat.id}</code>\n"
+        f"📋 <b>Type:</b> <code>{chat.type}</code>\n"
+        f"🏷 <b>Name:</b> {chat_title}\n"
+    )
+
+    if username:
+        text += f"🔗 <b>Username:</b> @{username}\n"
+
+    await m.reply_text(
+        text,
+        quote=True,
+    )
+
+
+# ==============================================================================
+# Ping
+# ==============================================================================
 
 @app.on_message(filters.command(["alive", "ping"]) & ~app.bl_users)
 @lang.language()

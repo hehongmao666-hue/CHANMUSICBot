@@ -180,6 +180,29 @@ class Downloader:
         )
 
     # ==========================================================================
+    # ==========================================================================
+    # TRANSIENT YOUTUBE DOWNLOAD ERRORS
+    # ==========================================================================
+
+    def _is_transient_download_error(self, error_message: str) -> bool:
+        if not error_message:
+            return False
+        msg = error_message.lower()
+        permanent = (
+            "this video is not available", "video is not available",
+            "private video", "has been removed", "members-only content",
+        )
+        if any(x in msg for x in permanent):
+            return False
+        transient = (
+            "the page needs to be reloaded", "http error 403", "http error 429",
+            "http error 500", "http error 502", "http error 503", "http error 504",
+            "unable to download video data", "connection reset", "connection aborted",
+            "timed out", "timeout", "temporarily unavailable",
+            "network is unreachable", "remote end closed connection",
+        )
+        return any(x in msg for x in transient)
+
     # COOKIE FAILURE LOG
     # ==========================================================================
 
@@ -394,6 +417,7 @@ class Downloader:
                     except yt_dlp.utils.ExtractorError as ex:
 
                         error_msg = str(ex)
+                        last_error["message"] = error_msg
 
                         if self._is_cookie_error(
                             error_msg
@@ -782,6 +806,8 @@ class Downloader:
                 # DOWNLOAD FUNCTION
                 # ==================================================================
 
+                last_error = {"message": ""}
+
                 def _download(
                     ydl_runtime_opts
                 ):
@@ -900,6 +926,7 @@ class Downloader:
                     except yt_dlp.utils.DownloadError as ex:
 
                         error_msg = str(ex)
+                        last_error["message"] = error_msg
 
                         # ------------------------------------------------------
                         # Detect cookie failure
@@ -981,6 +1008,7 @@ class Downloader:
 
                     except Exception as ex:
 
+                        last_error["message"] = str(ex)
                         logger.warning(
                             f"⚠️ Unexpected download error for "
                             f"{video_id}: {ex}"
@@ -1005,10 +1033,34 @@ class Downloader:
                                 pass
 
                 # ==================================================================
-                # RUN IN THREAD
+                # RELIABLE DOWNLOAD RETRY
                 # ==================================================================
+                max_attempts = 3
 
-                return await asyncio.to_thread(
-                    _download,
-                    ydl_opts
+                for attempt in range(1, max_attempts + 1):
+                    last_error["message"] = ""
+                    result = await asyncio.to_thread(_download, dict(ydl_opts))
+
+                    if result:
+                        if attempt > 1:
+                            logger.info(
+                                f"✅ YouTube recovered on retry {attempt}/{max_attempts}: {video_id}"
+                            )
+                        return result
+
+                    error_msg = last_error.get("message", "")
+                    if not self._is_transient_download_error(error_msg):
+                        return None
+
+                    if attempt < max_attempts:
+                        delay = 1.5 * attempt
+                        logger.warning(
+                            f"🔄 YouTube transient failure for {video_id}; "
+                            f"retry {attempt + 1}/{max_attempts} in {delay:.1f}s: {error_msg}"
+                        )
+                        await asyncio.sleep(delay)
+
+                logger.warning(
+                    f"❌ YouTube download failed after {max_attempts} attempts: {video_id}"
                 )
+                return None

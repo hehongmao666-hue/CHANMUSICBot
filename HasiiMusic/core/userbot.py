@@ -127,3 +127,4 @@ class Userbot(Client):
             logger.warning(f"Error stopping assistant 3: {e}")
         
         logger.info("Assistants stopped.")
+        
