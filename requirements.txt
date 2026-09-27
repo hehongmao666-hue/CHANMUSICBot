@@ -1,7 +1,7 @@
 # ==============================================================================
 # requirements.txt - Python Dependencies
 # ==============================================================================
-# This file lists all Python packages required for ˹ʜᴀꜱɪ�?ᴍᴜꜱɪᴄ˼.
+# This file lists all Python packages required for HasiiMusic.
 
 # Installation: pip install -r requirements.txt
  
