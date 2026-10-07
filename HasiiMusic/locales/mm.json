@@ -213,5 +213,9 @@
   "loop_single": "<blockquote>🔂 Loop Mode ကို Track တစ်ပုဒ်တည်းအတွက် သတ်မှတ်လိုက်ပါပြီ</blockquote>",
   "loop_queue_set": "<blockquote>🔁 Loop Mode ကို Queue အတွက် သတ်မှတ်လိုက်ပါပြီ</blockquote>",
   "loop_usage": "<blockquote><b>အသုံးပြုပုံ:</b>\n• /loop - Modes တွေကို လှည့်ပြီး ပြောင်းမယ်\n• /loop disable - Loop ကို ပိတ်မယ်\n• /loop single - လက်ရှိ Track ကို ပြန်ဖွင့်မယ်\n• /loop queue - Queue တစ်ခုလုံးကို ပြန်ဖွင့်မယ်</blockquote>",
-  "sudo_deleted": "\n- ဖျက်ထားတဲ့ Account ({0})"
+  "sudo_deleted": "\n- ဖျက်ထားတဲ့ Account ({0})",
+  "autoplay_usage": "<blockquote>အသုံးပြုပုံ - /autoplay [on/off]</blockquote>\n\n<b>ဥပမာ -</b> <code>/autoplay on</code> \\ <code>/autoplay off</code>",
+  "autoplay_status": "<blockquote>🤖 <b>Autoဖွင့်ခြင်း -</b> {0}</blockquote>\n\n<blockquote>အသုံးပြုပုံ - /autoplay [on/off]\n\n<b>ဥပမာ -</b> <code>/autoplay on</code> \\ <code>/autoplay off</code></blockquote>",
+  "autoplay_enabled": "<blockquote>🤖 <b>Autoဖွင့်ခြင်း ဖွင့်ထားပါပြီ။</b>\n\nQueue ကုန်သွားသောအခါ သီချင်းများကို Auto ထည့်ပြီး ဆက်လက်ဖွင့်ပေးပါမည်။</blockquote>",
+  "autoplay_disabled": "<blockquote>🤖 <b>Autoဖွင့်ခြင်း ပိတ်ထားပါပြီ။</b></blockquote>"
 }

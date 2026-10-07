@@ -45,6 +45,8 @@ class Downloader:
         self._download_locks: dict = {}
         self._download_lock_refs: dict = {}
 
+        self._cookie_warning_logged = False
+
         self._max_video_height = getattr(
             config,
             "VIDEO_MAX_HEIGHT",
@@ -105,10 +107,12 @@ class Downloader:
         # No cookie found
         # ----------------------------------------------------------------------
 
-        logger.warning(
-            "⚠️ YouTube cookies.txt was not found. "
-            "YouTube playback may fail if authentication is required."
-        )
+        if not self._cookie_warning_logged:
+            self._cookie_warning_logged = True
+            logger.warning(
+                "⚠️ YouTube cookies.txt was not found. "
+                "YouTube playback may fail if authentication is required."
+            )
 
         return None
 

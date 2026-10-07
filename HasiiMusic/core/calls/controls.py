@@ -92,6 +92,10 @@ class CallControls:
 
         try:
             queue.clear(chat_id)
+            try:
+                self.controller._queue._autoplay_recent.pop(chat_id, None)
+            except Exception:
+                pass
             await db.remove_call(chat_id)
         except Exception as e:
             logger.warning(f"Error clearing queue/call for {chat_id}: {e}")

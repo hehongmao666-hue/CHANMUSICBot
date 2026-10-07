@@ -25,6 +25,7 @@ from .manager import CallsManager
 from .player import CallPlayer
 from .controls import CallControls
 from .queue import CallQueue
+from collections import deque
 
 logging.getLogger('pyrogram.dispatcher').addFilter(PyTgCallsErrorFilter())
 
@@ -37,12 +38,20 @@ class TgCall(PyTgCalls):
         self._chat_locks = {}
         self._session_gen = {}
         self._track_index = {}
+        # Playback timing used to reject delayed/duplicate StreamEnded events.
+        self._play_started_at = {}
+        self._play_duration = {}
         self._pending_transitions = set()
         self._transition_tasks = {}
         self._stopping = set()
         self._idle_reconcile_task = None
         self._vc_watchdog_task = None
         self._vc_recovery_state = {}
+        # Per-session autoplay memory.  Prevents the recommendation engine from
+        # immediately selecting the same song/ID again under a different search
+        # result or title variant.
+        self._autoplay_recent = {}
+        self._autoplay_failed = {}
 
         # Components
         self._utils = CallsUtils(self)
@@ -58,6 +67,8 @@ class TgCall(PyTgCalls):
         self._session_gen[chat_id] = generation
         self._track_index[chat_id] = 0
         self._pending_transitions.discard(chat_id)
+        self._autoplay_recent[chat_id] = deque(maxlen=12)
+        self._autoplay_failed[chat_id] = set()
         return generation
 
     def _transition_done(self, chat_id: int, task: asyncio.Task) -> None:
@@ -109,6 +120,10 @@ class TgCall(PyTgCalls):
 
             self._pending_transitions.discard(chat_id)
             self._track_index.pop(chat_id, None)
+            self._play_started_at.pop(chat_id, None)
+            self._play_duration.pop(chat_id, None)
+            self._autoplay_recent.pop(chat_id, None)
+            self._autoplay_failed.pop(chat_id, None)
             self._session_gen.pop(chat_id, None)
             self._chat_locks.pop(chat_id, None)
             self._stopping.discard(chat_id)
@@ -248,6 +263,8 @@ class TgCall(PyTgCalls):
         state_chats = set(self._chat_locks)
         state_chats.update(self._session_gen)
         state_chats.update(self._track_index)
+        state_chats.update(self._play_started_at)
+        state_chats.update(self._play_duration)
         state_chats.update(self._transition_tasks)
         state_chats.update(self._stopping)
         state_chats.update(self._pending_transitions)
@@ -282,6 +299,8 @@ class TgCall(PyTgCalls):
 
                 self._pending_transitions.discard(chat_id)
                 self._track_index.pop(chat_id, None)
+                self._play_started_at.pop(chat_id, None)
+                self._play_duration.pop(chat_id, None)
                 self._session_gen.pop(chat_id, None)
                 self._chat_locks.pop(chat_id, None)
                 self._stopping.discard(chat_id)

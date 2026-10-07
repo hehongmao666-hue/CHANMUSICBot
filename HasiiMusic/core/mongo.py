@@ -403,6 +403,21 @@ class MongoDB:
                 upsert=True,
             )
 
+    # AUTOPLAY METHODS
+    async def get_autoplay(self, chat_id: int) -> bool:
+        doc = await self.cache.find_one({"_id": f"autoplay_{chat_id}"})
+        return bool(doc.get("enabled", False)) if doc else False
+
+    async def set_autoplay(self, chat_id: int, enabled: bool) -> None:
+        if enabled:
+            await self.cache.update_one(
+                {"_id": f"autoplay_{chat_id}"},
+                {"$set": {"enabled": True}},
+                upsert=True,
+            )
+        else:
+            await self.cache.delete_one({"_id": f"autoplay_{chat_id}"})
+
     # PLAY MODE METHODS
     async def get_play_mode(self, chat_id: int) -> bool:
         if chat_id not in self.play_mode:

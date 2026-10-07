@@ -213,5 +213,9 @@
   "loop_single": "<blockquote>🔂 Ang loop mode ay naka-set sa Single Track</blockquote>",
   "loop_queue_set": "<blockquote>🔁 Ang loop mode ay naka-set sa Pila</blockquote>",
   "loop_usage": "<blockquote><b>Paggamit:</b>\n• /loop - I-cycle ang mga mode\n• /loop disable - I-disable ang loop\n• /loop single - I-loop ang kasalukuyang track\n• /loop queue - I-loop ang buong pila</blockquote>",
-  "sudo_deleted": "\n- Deleted Account ({0})"
+  "sudo_deleted": "\n- Deleted Account ({0})",
+  "autoplay_usage": "<blockquote>Paraan ng paggamit: /autoplay [on/off]</blockquote>\n\n<b>Halimbawa:</b> <code>/autoplay on</code> \\ <code>/autoplay off</code>",
+  "autoplay_status": "<blockquote>🤖 <b>Auto-play:</b> {0}</blockquote>\n\n<blockquote>Paraan ng paggamit: /autoplay [on/off]\n\n<b>Halimbawa:</b> <code>/autoplay on</code> \\ <code>/autoplay off</code></blockquote>",
+  "autoplay_enabled": "<blockquote>🤖 <b>Naka-enable ang auto-play.</b>\n\nAwtomatikong magdadagdag ng mga kaugnay na kanta kapag ubos na ang queue.</blockquote>",
+  "autoplay_disabled": "<blockquote>🤖 <b>Naka-disable ang auto-play.</b></blockquote>"
 }

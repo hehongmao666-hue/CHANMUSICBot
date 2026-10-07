@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import time
 from ntgcalls import ConnectionNotFound, TelegramServerError
 import ntgcalls
 from pytgcalls import PyTgCalls, exceptions, types
@@ -54,6 +55,24 @@ class CallsManager:
                         if not await db.get_call(chat_id):
                             self.controller._pending_transitions.discard(chat_id)
                             return
+                        # PyTgCalls can emit a delayed/duplicate StreamEnded update
+                        # after a track has already been replaced. Without this guard,
+                        # each stale event can consume the newly-started autoplay track
+                        # and immediately trigger another recommendation.
+                        started_at = self.controller._play_started_at.get(chat_id)
+                        if started_at is not None:
+                            elapsed = time.monotonic() - started_at
+                            duration = float(self.controller._play_duration.get(chat_id) or 0)
+                            # Require a reasonable portion of the current track to have
+                            # elapsed before accepting StreamEnded. Cap the guard so very
+                            # short clips still transition normally.
+                            min_elapsed = min(15.0, max(4.0, duration * 0.25)) if duration > 0 else 5.0
+                            if elapsed < min_elapsed:
+                                logger.debug(
+                                    "Ignoring early/delayed StreamEnded for %s: elapsed=%.1fs threshold=%.1fs",
+                                    chat_id, elapsed, min_elapsed,
+                                )
+                                return
                         expected_index = self.controller._track_index.get(chat_id, 0)
                         self.controller.schedule_transition(chat_id, expected_index)
                 elif isinstance(update, types.ChatUpdate):

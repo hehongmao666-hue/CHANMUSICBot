@@ -12,6 +12,8 @@
 
 import asyncio
 import re
+import unicodedata
+from difflib import SequenceMatcher
 from pyrogram import errors
 from HasiiMusic import app, config, db, lang, logger, preload, queue, yt
 
@@ -78,6 +80,7 @@ class CallQueue:
                         await db.rm_chat(chat_id)
                     return
 
+            previous_media = queue.get_current(chat_id)
             media = queue.get_next(chat_id)
 
             if not media and loop_mode == 10:
@@ -129,18 +132,160 @@ class CallQueue:
                     f"Could not delete previous message in {chat_id}: {e}")
 
             if not media:
-                if config.QUEUE_END_MESSAGE:
-                    _lang = await lang.get_lang(chat_id)
+                # Autoplay: when the queue is exhausted, choose a genuinely
+                # different related track and continue in the same voice chat.
+                # Loop modes above intentionally take priority over autoplay.
+                if await db.get_autoplay(chat_id) and previous_media:
                     try:
-                        await app.send_message(
-                            chat_id=chat_id,
-                            text=_lang.get(
-                                "queue_end_message", "✅ Queue finished. Stream ended automatically.")
+                        recent = self.controller._autoplay_recent.setdefault(
+                            chat_id, __import__("collections").deque(maxlen=12)
                         )
+                        failed = self.controller._autoplay_failed.setdefault(
+                            chat_id, set()
+                        )
+
+                        def _norm(value: str) -> str:
+                            value = unicodedata.normalize("NFKC", value or "").lower()
+                            value = re.sub(
+                                r"\b(official\s*(audio|video)|lyrics?|visualizer|hd|4k)\b",
+                                " ",
+                                value,
+                            )
+                            value = re.sub(r"[^\w\u3400-\u9fff\uac00-\ud7a3]+", " ", value)
+                            return re.sub(r"\s+", " ", value).strip()
+
+                        previous_title = _norm(getattr(previous_media, "title", ""))
+                        previous_id = getattr(previous_media, "id", None)
+                        queue_ids = {
+                            getattr(item, "id", None)
+                            for item in queue.get_queue(chat_id)
+                        }
+                        recent_ids = {item[0] for item in recent if item}
+                        recent_titles = {item[1] for item in recent if len(item) > 1}
+
+                        def _same_song(candidate) -> bool:
+                            cid = getattr(candidate, "id", None)
+                            if not cid or cid == previous_id or cid in queue_ids:
+                                return True
+                            if cid in failed or cid in recent_ids:
+                                return True
+
+                            ctitle = _norm(getattr(candidate, "title", ""))
+                            if not ctitle or ctitle == previous_title:
+                                return True
+                            if (
+                                min(len(ctitle), len(previous_title)) >= 8
+                                and (
+                                    ctitle in previous_title
+                                    or previous_title in ctitle
+                                )
+                            ):
+                                return True
+                            if ctitle in recent_titles:
+                                return True
+
+                            # Search results frequently return the same recording
+                            # with slightly different punctuation/channel suffixes.
+                            # Reject near-identical titles but allow same-artist songs.
+                            if SequenceMatcher(None, ctitle, previous_title).ratio() >= 0.78:
+                                return True
+                            return False
+
+                        title = getattr(previous_media, "title", "") or ""
+                        channel = getattr(previous_media, "channel_name", "") or ""
+
+                        # Prefer artist/channel-level discovery instead of searching
+                        # the exact finished title first. Exact-title searches are
+                        # what caused the observed autoplay loop.
+                        artist_hint = re.split(
+                            r"\s[-–—|:/]\s", title, maxsplit=1
+                        )[0].strip()
+                        if not artist_hint:
+                            artist_hint = channel
+
+                        queries = []
+                        if artist_hint:
+                            queries.extend([
+                                f"{artist_hint} similar songs",
+                                f"{artist_hint} best songs",
+                            ])
+                        if title:
+                            queries.append(f"{title} related songs")
+                        if channel and channel.lower() != artist_hint.lower():
+                            queries.append(f"{channel} songs")
+
+                        recommendation = None
+                        seen_candidates = set()
+
+                        for query in queries:
+                            if not query:
+                                continue
+                            candidates = await yt.search_candidates(
+                                query, 0, music=True, limit=5
+                            )
+                            for candidate in candidates:
+                                cid = getattr(candidate, "id", None)
+                                if cid in seen_candidates:
+                                    continue
+                                seen_candidates.add(cid)
+                                if _same_song(candidate):
+                                    continue
+                                if getattr(candidate, "is_live", False):
+                                    continue
+                                recommendation = candidate
+                                break
+                            if recommendation:
+                                break
+
+                        if recommendation:
+                            recommendation.user = None
+                            recommendation.message_id = 0
+                            recommendation.file_path = None
+                            queue.add(chat_id, recommendation)
+                            media = queue.get_current(chat_id)
+                            recent.append((
+                                getattr(media, "id", None),
+                                _norm(getattr(media, "title", "")),
+                            ))
+                            logger.info(
+                                f"🤖 Autoplay selected '{getattr(media, 'title', 'unknown')}' "
+                                f"for {chat_id}"
+                            )
+                        else:
+                            logger.info(
+                                f"🤖 Autoplay found no new recommendation for {chat_id}; "
+                                "keeping the current session safe instead of repeating a track"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Autoplay search failed for {chat_id}: {e}")
+
+                if not media:
+                    if config.QUEUE_END_MESSAGE:
+                        _lang = await lang.get_lang(chat_id)
+                        try:
+                            await app.send_message(
+                                chat_id=chat_id,
+                                text=_lang.get(
+                                    "queue_end_message", "✅ Queue finished. Stream ended automatically.")
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                f"Could not send queue_end message in {chat_id}: {e}")
+                    return await self.controller._controls._stop_impl(chat_id)
+
+                # Remove the previous track's status message before sending
+                # the autoplay track message below.
+                if previous_media and previous_media.message_id:
+                    try:
+                        await app.delete_messages(
+                            chat_id=chat_id,
+                            message_ids=previous_media.message_id,
+                            revoke=True,
+                        )
+                        previous_media.message_id = 0
                     except Exception as e:
                         logger.debug(
-                            f"Could not send queue_end message in {chat_id}: {e}")
-                return await self.controller._controls._stop_impl(chat_id)
+                            f"Could not delete previous autoplay message in {chat_id}: {e}")
 
             _lang = await lang.get_lang(chat_id)
             msg = None
@@ -181,10 +326,23 @@ class CallQueue:
                     logger.info(f"Queue altered during play_next download for {chat_id}")
                     return
                 if not media.file_path:
-                    if len(queue.get_queue(chat_id)) > 1:
-                        logger.warning(
-                            f"Skipping unplayable track '{getattr(media, 'title', 'unknown')}' in {chat_id}")
+                    failed_id = getattr(media, "id", None)
+                    if failed_id:
+                        self.controller._autoplay_failed.setdefault(
+                            chat_id, set()
+                        ).add(failed_id)
+
+                    logger.warning(
+                        f"Skipping unplayable track '{getattr(media, 'title', 'unknown')}' "
+                        f"in {chat_id}"
+                    )
+
+                    # Remove/advance through the failed item. If autoplay is
+                    # enabled, let the normal exhausted-queue path search for
+                    # another candidate instead of retrying the same bad ID.
+                    if len(queue.get_queue(chat_id)) > 1 or await db.get_autoplay(chat_id):
                         return await self._play_next_impl(chat_id)
+
                     await self.controller._controls._stop_impl(chat_id)
                     if msg:
                         try:

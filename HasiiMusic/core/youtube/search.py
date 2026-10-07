@@ -238,6 +238,99 @@ class Searcher:
             )
             return None
 
+
+    async def search_candidates(
+        self,
+        query: str,
+        m_id: int = 0,
+        music: bool = False,
+        limit: int = 5,
+    ) -> list[Track]:
+        """Return multiple YouTube search candidates.
+
+        This is intentionally separate from ``search()`` so existing callers
+        keep the original single-result behaviour.  Autoplay needs several
+        candidates because the first YouTube result is often the exact track
+        that just finished.
+        """
+        if not query:
+            return []
+
+        limit = max(1, min(int(limit or 5), 10))
+        search_query = query
+        if music and not search_query.lower().endswith("audio"):
+            search_query = f"{search_query} Official Audio"
+
+        try:
+            def _extract_candidates():
+                cookie = (
+                    self._cookies.get_cookies()
+                    if self._cookies.checked
+                    else None
+                )
+                ydl_opts = {
+                    "quiet": True,
+                    "extract_flat": True,
+                    "cookiefile": cookie,
+                    "js_runtimes": {"node": {}},
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(
+                        f"ytsearch{limit}:{search_query}",
+                        download=False,
+                    )
+
+            results = await asyncio.to_thread(_extract_candidates)
+            entries = [
+                e for e in (results or {}).get("entries", [])
+                if e and e.get("id")
+            ]
+            candidates = []
+
+            for data in entries[:limit]:
+                duration_sec = data.get("duration")
+                is_live = data.get("is_live", False)
+                if duration_sec is None and is_live:
+                    duration = "LIVE"
+                    duration_sec = 0
+                else:
+                    duration = (
+                        utils.format_duration(int(duration_sec))
+                        if duration_sec else "0:00"
+                    )
+
+                candidates.append(
+                    Track(
+                        id=data.get("id"),
+                        channel_name=data.get("uploader")
+                        or data.get("channel", ""),
+                        duration=duration,
+                        duration_sec=int(duration_sec) if duration_sec else 0,
+                        message_id=m_id,
+                        title=(data.get("title") or "")[:25],
+                        thumbnail=(
+                            data.get("thumbnails", [{}])[-1]
+                            .get("url", "")
+                            .split("?")[0]
+                            if data.get("thumbnails") else ""
+                        ),
+                        url=(
+                            data.get("url")
+                            or data.get("webpage_url")
+                            or f"https://youtube.com/watch?v={data.get('id')}"
+                        ),
+                        view_count=str(data.get("view_count", "")),
+                        is_live=is_live,
+                    )
+                )
+
+            return candidates
+        except Exception as e:
+            logger.warning(
+                f"⚠️ YouTube candidate search failed for '{query}': {e}"
+            )
+            return []
+
     def alternatives(self, video_id: str) -> list[str]:
         """Return fallback video IDs collected for a search result."""
         return list(self._candidate_cache.get(video_id, []))

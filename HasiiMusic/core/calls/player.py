@@ -13,6 +13,7 @@
 
 import asyncio
 import re
+import time
 from ntgcalls import ConnectionNotFound, TelegramServerError, TransportParseException
 from pyrogram import enums, errors
 from pyrogram.types import Message
@@ -85,14 +86,25 @@ class CallPlayer:
         except errors.RPCError as e:
             raise
 
-        # Configure audio stream with optimized buffering for lag-free playback. larger buffers help reduce playback lag
-        if seek_time > 1:
-            # seek to the position first and keep the buffers
-            ffmpeg_params = f"-ss {seek_time} -probesize 4M -analyzeduration 2M -rtbufsize 2M -fflags +genpts+igndts"
-        else:
-            ffmpeg_params = "-probesize 4M -analyzeduration 2M -rtbufsize 2M -fflags +genpts+igndts -sync ext"
-
+        # Stable realtime audio pipeline.
+        # Avoid ``-sync ext`` here: for local audio files it can cause timestamp
+        # corrections that show up as small skips/stutters in long playback.
+        # Audio is also explicitly stripped of video/subtitle/data streams so
+        # FFmpeg does not spend work probing or processing unused streams.
         is_video = getattr(media, "video", False)
+        if seek_time > 1:
+            ffmpeg_params = (
+                f"-ss {seek_time} -probesize 2M -analyzeduration 1M "
+                "-fflags +genpts+igndts"
+            )
+        else:
+            ffmpeg_params = (
+                "-probesize 2M -analyzeduration 1M "
+                "-fflags +genpts+igndts"
+            )
+
+        if not is_video:
+            ffmpeg_params += " -vn -sn -dn"
         video_flags = (
             types.MediaStream.Flags.AUTO_DETECT
             if is_video
@@ -101,7 +113,9 @@ class CallPlayer:
 
         kwargs = {
             "media_path": media.file_path,
-            "audio_parameters": types.AudioQuality.HIGH,
+            # MEDIUM is a better balance for Telegram voice chats: it lowers
+            # uplink pressure while remaining clear for music playback.
+            "audio_parameters": types.AudioQuality.MEDIUM,
             "audio_flags": types.MediaStream.Flags.REQUIRED,
             "video_flags": video_flags,
             "ffmpeg_parameters": ffmpeg_params,
@@ -143,6 +157,13 @@ class CallPlayer:
                         config=types.GroupCallConfig(auto_start=True),
                     )
                     await log_call_lifecycle_snapshot("AFTER_PLAY", client, chat_id)
+                    # Record the start of the stream. The update handler uses this
+                    # timestamp to reject stale StreamEnded events from the previous
+                    # stream, which is especially important for autoplay.
+                    self.controller._play_started_at[chat_id] = time.monotonic()
+                    self.controller._play_duration[chat_id] = float(
+                        getattr(media, "duration_sec", 0) or 0
+                    )
                     break
 
                 except (exceptions.NoActiveGroupCall, errors.RPCError) as e:

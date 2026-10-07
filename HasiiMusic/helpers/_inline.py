@@ -124,55 +124,65 @@ class Inline:
         if not remove:
             keyboard.append(
                 [
-                    self.ikb(
+                    self._button(
                         text="⏪ 30s",
                         callback_data=f"controls seek_back_30 {chat_id}",
+                        style="primary",
                     ),
-                    self.ikb(
+                    self._button(
                         text="⏪ 10s",
                         callback_data=f"controls seek_back_10 {chat_id}",
+                        style="primary",
                     ),
-                    self.ikb(
+                    self._button(
                         text="10s ⏩",
                         callback_data=f"controls seek_forward_10 {chat_id}",
+                        style="primary",
                     ),
-                    self.ikb(
+                    self._button(
                         text="30s ⏩",
                         callback_data=f"controls seek_forward_30 {chat_id}",
+                        style="primary",
                     ),
                 ]
             )
 
             keyboard.append(
                 [
-                    self.ikb(
+                    self._button(
                         text="▶️",
                         callback_data=f"controls resume {chat_id}",
+                        style="success",
                     ),
-                    self.ikb(
+                    self._button(
                         text="⏸️",
                         callback_data=f"controls pause {chat_id}",
+                        style="primary",
                     ),
-                    self.ikb(
+                    self._button(
                         text="🔂",
                         callback_data=f"controls replay {chat_id}",
+                        style="success",
                     ),
-                    self.ikb(
+                    self._button(
                         text="⏭️",
                         callback_data=f"controls skip {chat_id}",
+                        style="primary",
                     ),
-                    self.ikb(
+                    self._button(
                         text="⏹️",
                         callback_data=f"controls stop {chat_id}",
+                        style="danger",
                     ),
                 ]
             )
 
             keyboard.append(
                 [
-                    self.ikb(
+                    self._button(
                         text="🗑️ DELETE",
                         callback_data=f"controls close {chat_id}",
+                        style="danger",
                     )
                 ]
             )
