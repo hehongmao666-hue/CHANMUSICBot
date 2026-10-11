@@ -319,7 +319,7 @@ class Inline:
                 [
                     self._button(
                         text="➕ Add Me to Your Group",
-                        url=f"https://t.me/{app.username}?startgroup=true",
+                        url=f"https://t.me/{app.username}?startgroup=true&admin=manage_call+delete_messages+invite_users",
                         style="success",
                     ),
                 ],
@@ -436,7 +436,7 @@ class Inline:
             [
                 self._button(
                     text=f"➕ {lang['add_me']}",
-                    url=f"https://t.me/{app.username}?startgroup=true",
+                    url=f"https://t.me/{app.username}?startgroup=true&admin=manage_call+delete_messages+invite_users",
                     style="success",
                 )
             ],

@@ -47,6 +47,9 @@ class TgCall(PyTgCalls):
         self._idle_reconcile_task = None
         self._vc_watchdog_task = None
         self._vc_recovery_state = {}
+        # Network interruptions are not explicit user stops. Preserve the current
+        # track/session for a 60-second grace window before attempting recovery.
+        self._vc_network_grace = {}
         # Per-session autoplay memory.  Prevents the recommendation engine from
         # immediately selecting the same song/ID again under a different search
         # result or title variant.
@@ -59,6 +62,30 @@ class TgCall(PyTgCalls):
         self._player = CallPlayer(self)
         self._controls = CallControls(self)
         self._queue = CallQueue(self)
+
+    def mark_network_interruption(self, chat_id: int, reason: str = "network error") -> None:
+        """Preserve playback state for 60s after a transient network failure."""
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return
+
+        previous_until = self._vc_network_grace.get(chat_id, 0.0)
+        if previous_until <= now:
+            self._vc_network_grace[chat_id] = now + 60.0
+            state = self._vc_recovery_state.setdefault(chat_id, {})
+            state.update({
+                "missing": 0,
+                "attempts": 0,
+                "next_at": 0.0,
+                "missing_since": now,
+            })
+        logger.warning(
+            "NETWORK_GRACE chat=%s seconds_remaining=%.1f reason=%s; preserving playback state",
+            chat_id,
+            max(0.0, self._vc_network_grace.get(chat_id, now) - now),
+            str(reason)[:160],
+        )
 
     def begin_session(self, chat_id: int) -> int:
         """Start a new user-requested playback session for a chat."""
@@ -168,6 +195,53 @@ class TgCall(PyTgCalls):
             except Exception:
                 continue
         return active if seen else None
+
+    async def _native_playback_idle(self, chat_id: int) -> bool:
+        """Inspect native playback state; log failures for diagnosis."""
+        clients = list(self.clients)
+        found_call = False
+
+        for index, client in enumerate(clients):
+            try:
+                calls = await client.calls
+                call = calls.get(chat_id) if calls is not None else None
+
+                if call is None:
+                    logger.debug(
+                        f"Playback diagnostic: chat={chat_id}, "
+                        f"client_index={index}, call_not_found"
+                    )
+                    continue
+
+                found_call = True
+                playback = getattr(call, "playback", None)
+                status_name = getattr(
+                    playback, "name", str(playback)
+                ).upper()
+
+                logger.info(
+                    f"Playback diagnostic: chat={chat_id}, "
+                    f"client_index={index}, "
+                    f"playback_type={type(playback).__name__}, "
+                    f"playback_repr={playback!r}, "
+                    f"status_name={status_name}"
+                )
+                return "IDLE" in status_name
+
+            except Exception:
+                logger.exception(
+                    f"Playback state inspection failed: "
+                    f"chat={chat_id}, client_index={index}"
+                )
+
+        if not found_call:
+            logger.warning(
+                f"Playback diagnostic: no native call found "
+                f"for chat={chat_id} across {len(clients)} clients"
+            )
+
+        # Do not force recovery when the state cannot be confirmed.
+        return False
 
     async def _native_call_count(self):
         """Return the total native call count when the binding exposes it."""
@@ -321,7 +395,7 @@ class TgCall(PyTgCalls):
             )
         return cleaned + native_cleaned
 
-    async def _recover_ghost_chat(self, chat_id: int):
+    async def _recover_ghost_chat(self, chat_id: int, force_stream_recovery: bool = False):
         """Recover one chat whose Python playback state is alive but native VC is gone.
 
         Returns:
@@ -339,26 +413,31 @@ class TgCall(PyTgCalls):
         async with lock:
             if chat_id in self._stopping:
                 return False
+            media = queue.get_current(chat_id)
+            if media is None:
+                logger.warning(f"👻 Ghost VC has no current media; cannot recover {chat_id}")
+                return False
+
+            # A previous pause/resume failure or legacy cleanup may have removed
+            # the Python active-call marker while leaving the queue intact. A
+            # queued current track plus confirmed missing native VC is sufficient
+            # evidence to restore the in-memory session for this chat only.
             if not await db.get_call(chat_id):
-                return False
-            try:
-                if not await db.playing(chat_id):
-                    return False
-            except (KeyError, TypeError):
-                return False
+                await db.add_call(chat_id)
+                await db.playing(chat_id, paused=False)
+                logger.warning(f"♻️ Restored stale playback marker from queue for {chat_id}")
+            else:
+                try:
+                    if not await db.playing(chat_id):
+                        return False
+                except (KeyError, TypeError):
+                    await db.playing(chat_id, paused=False)
 
             active_ids = await self._native_call_ids()
             if active_ids is None:
                 return False
-            if chat_id in active_ids:
+            if chat_id in active_ids and not force_stream_recovery:
                 return True
-
-            media = queue.get_current(chat_id)
-            if media is None:
-                logger.warning(
-                    f"👻 Ghost VC has no current media; leaving state untouched for {chat_id}"
-                )
-                return False
 
             if not getattr(media, "file_path", None):
                 logger.warning(
@@ -392,7 +471,8 @@ class TgCall(PyTgCalls):
 
             await asyncio.sleep(0.75)
             active_after = await self._native_call_ids()
-            if active_after is not None and chat_id in active_after:
+            if (active_after is not None and chat_id in active_after
+                    and not await self._native_playback_idle(chat_id)):
                 try:
                     from HasiiMusic import preload
                     await preload.start_preload(chat_id, count=1)
@@ -419,63 +499,148 @@ class TgCall(PyTgCalls):
         try:
             while True:
                 await asyncio.sleep(10)
+                logger.info('VC watchdog heartbeat: loop alive')
 
                 active_ids = await self._native_call_ids()
                 if active_ids is None:
                     continue
 
                 active_calls = getattr(db, "active_calls", {})
-                for chat_id in list(active_calls.keys()):
+                # Queue-backed chats are included so a stale/missing active_calls
+                # marker cannot permanently hide an orphaned playback session.
+                candidate_chats = set(active_calls.keys())
+                candidate_chats.update(getattr(queue, "queues", {}).keys())
+                logger.info(
+                    f"VC watchdog candidates={sorted(candidate_chats)}, "
+                    f"native_ids={sorted(active_ids)}"
+                )
+                for chat_id in list(candidate_chats):
                     try:
                         if chat_id in self._stopping:
+                            logger.warning(
+                                f"VC watchdog skipped chat={chat_id}: "
+                                f"marked stopping; stopping={sorted(self._stopping)}"
+                            )
                             self._vc_recovery_state.pop(chat_id, None)
                             continue
 
-                        if not await db.get_call(chat_id):
+                        has_call = await db.get_call(chat_id)
+                        has_current_media = queue.get_current(chat_id) is not None
+                        logger.info(
+                            f"VC watchdog candidate chat={chat_id}, "
+                            f"has_call={has_call}, "
+                            f"has_current_media={has_current_media}, "
+                            f"native_present={chat_id in active_ids}"
+                        )
+                        if not has_call and not has_current_media:
                             self._vc_recovery_state.pop(chat_id, None)
                             continue
 
-                        if not await db.playing(chat_id):
+                        if has_call and not await db.playing(chat_id):
+                            logger.info(
+                                f"VC watchdog skipped chat={chat_id}: "
+                                f"DB says not playing"
+                            )
                             # Paused playback is intentionally not auto-rejoined.
                             self._vc_recovery_state.pop(chat_id, None)
                             continue
 
-                        if queue.get_current(chat_id) is None:
-                            self._vc_recovery_state.pop(chat_id, None)
-                            continue
-
-                        if chat_id in active_ids:
-                            if chat_id in self._vc_recovery_state:
-                                logger.info(
-                                    f"✅ VC watchdog cleared recovery state for {chat_id}"
-                                )
+                        if not has_current_media:
+                            logger.info(
+                                f"VC watchdog skipped chat={chat_id}: "
+                                f"no current media"
+                            )
                             self._vc_recovery_state.pop(chat_id, None)
                             continue
 
                         loop = asyncio.get_running_loop()
                         now = loop.time()
+                        grace_until = self._vc_network_grace.get(chat_id, 0.0)
+                        if now < grace_until:
+                            continue
+                        if grace_until:
+                            self._vc_network_grace.pop(chat_id, None)
+
+                        force_stream_recovery = False
+                        if chat_id in active_ids:
+                            # A stale low-level native id can survive after the
+                            # public PyTgCalls call has disappeared. Cross-check
+                            # both views before deciding the voice chat is healthy.
+                            public_call_found = False
+                            public_state_known = False
+                            for client in list(self.clients):
+                                try:
+                                    public_calls = await client.calls
+                                    public_state_known = True
+                                    if public_calls and chat_id in public_calls:
+                                        public_call_found = True
+                                        break
+                                except Exception:
+                                    continue
+
+                            if public_state_known and not public_call_found:
+                                force_stream_recovery = True
+                                logger.warning(
+                                    f"Native binding still lists chat={chat_id}, "
+                                    "but PyTgCalls has no public call; treating it "
+                                    "as stale after network interruption"
+                                )
+                            else:
+                                force_stream_recovery = (
+                                    await self._native_playback_idle(chat_id)
+                                )
+                            if not force_stream_recovery:
+                                if chat_id in self._vc_recovery_state:
+                                    logger.info(
+                                        f"VC watchdog cleared recovery state for {chat_id}"
+                                    )
+                                self._vc_recovery_state.pop(chat_id, None)
+                                continue
+
+                            logger.warning(
+                                f"Native call exists but playback is IDLE "
+                                f"for {chat_id}; scheduling stream recovery"
+                            )
+
                         state = self._vc_recovery_state.setdefault(
                             chat_id,
-                            {"missing": 0, "attempts": 0, "next_at": 0.0},
+                            {
+                                "missing": 0,
+                                "attempts": 0,
+                                "next_at": 0.0,
+                                "missing_since": now,
+                            },
                         )
                         state["missing"] += 1
+                        state.setdefault("missing_since", now)
 
-                        if state["missing"] == 1:
-                            logger.warning(
-                                f"👻 Ghost VC detected for {chat_id}; "
-                                "waiting for one more confirmation"
-                            )
+                        # Grace period for short network interruptions: keep the
+                        # playback account/session state untouched for 60 seconds.
+                        # Only attempt rejoin after the native call has remained
+                        # missing for the full grace window.
+                        missing_for = now - state["missing_since"]
+                        grace_period = 20 if force_stream_recovery else 60
+                        if missing_for < grace_period:
+                            if state["missing"] == 1:
+                                logger.warning(
+                                    f"👻 Native VC missing for {chat_id}; "
+                                    "preserving session for 60s grace period"
+                                )
                             continue
 
                         if now < state["next_at"]:
                             continue
 
-                        result = await self._recover_ghost_chat(chat_id)
+                        result = await self._recover_ghost_chat(
+                            chat_id,
+                            force_stream_recovery=force_stream_recovery,
+                        )
                         if result is None:
                             continue
 
                         if result:
                             self._vc_recovery_state.pop(chat_id, None)
+                            self._vc_network_grace.pop(chat_id, None)
                             continue
 
                         state["attempts"] += 1

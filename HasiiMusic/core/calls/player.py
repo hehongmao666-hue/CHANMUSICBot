@@ -191,37 +191,20 @@ class CallPlayer:
                         delay = retry_delay * (attempt + 1)
 
                         logger.warning(
-                            f"Transport error for {chat_id}; rebuilding "
+                            f"Transport error for {chat_id}; retrying "
                             f"current chat only "
                             f"(attempt {attempt + 1}/{max_retries})"
                         )
 
-                        try:
-                            await log_call_lifecycle_snapshot(
-                                "BEFORE_LEAVE",
-                                client,
-                                chat_id,
-                            )
-                        except Exception:
-                            pass
-
-                        try:
-                            await client.leave_call(chat_id, close=False)
-                        except Exception as e:
-                            logger.debug(
-                                f"Transport recovery leave failed "
-                                f"for {chat_id}: {e}"
-                            )
-
-                        try:
-                            await log_call_lifecycle_snapshot(
-                                "AFTER_LEAVE",
-                                client,
-                                chat_id,
-                            )
-                        except Exception:
-                            pass
-
+                        # A transient transport parse error can happen during a
+                        # brief network interruption. Do not leave the VC here:
+                        # tearing down the native call can strand playback state
+                        # and make recovery depend on a later rejoin.
+                        logger.warning(
+                            "VC_RETRY_WITHOUT_LEAVE chat_id=%s reason=TransportParseException attempt=%s",
+                            chat_id,
+                            attempt + 1,
+                        )
                         await asyncio.sleep(delay)
                         continue
 
@@ -245,32 +228,15 @@ class CallPlayer:
                         except Exception:
                             pass
 
-                        try:
-                            await log_call_lifecycle_snapshot(
-                                "BEFORE_LEAVE",
-                                client,
-                                chat_id,
-                            )
-                        except Exception:
-                            pass
-
-                        try:
-                            await client.leave_call(chat_id, close=False)
-                        except Exception as leave_error:
-                            logger.debug(
-                                f"Timeout recovery leave failed "
-                                f"for {chat_id}: {leave_error}"
-                            )
-
-                        try:
-                            await log_call_lifecycle_snapshot(
-                                "AFTER_LEAVE",
-                                client,
-                                chat_id,
-                            )
-                        except Exception:
-                            pass
-
+                        # A timeout during a network outage is not proof that
+                        # the Telegram VC itself must be torn down. Keep the call
+                        # and retry in place; final handlers preserve active state
+                        # so the watchdog can recover if native state disappears.
+                        logger.warning(
+                            "VC_RETRY_WITHOUT_LEAVE chat_id=%s reason=TimeoutError attempt=%s",
+                            chat_id,
+                            attempt + 1,
+                        )
                         await asyncio.sleep(delay)
                         continue
 
@@ -278,51 +244,74 @@ class CallPlayer:
 
                 except Exception as e:
                     error_msg = str(e).lower()
-                    recoverable = (
+                    # Only the known duplicate-initialization state warrants a
+                    # targeted leave/rebuild. Generic connection/transport errors
+                    # may be transient network failures; do not tear down the VC.
+                    needs_native_reset = (
                         "cannot be initialized more than once" in error_msg
+                    )
+                    recoverable = (
+                        needs_native_reset
                         or "connection" in error_msg
                         or "not in a call" in error_msg
                         or "transport" in error_msg
                     )
 
-                    if recoverable and attempt < max_retries - 1:
-                        delay = retry_delay * (attempt + 1)
-
-                        logger.warning(
-                            f"Recoverable call error for {chat_id}; "
-                            f"rebuilding current chat only "
-                            f"(attempt {attempt + 1}/{max_retries})"
+                    if recoverable:
+                        # A duplicate native initialization error normally invites a
+                        # leave/rebuild cycle. During an active playback session this
+                        # is unsafe: a short network outage can produce the same error,
+                        # and leave_call() destroys the call before the 60s grace period
+                        # can protect it. Preserve the session and let the watchdog
+                        # recover after the grace window instead.
+                        active_session = recovery or (
+                            await db.get_call(chat_id) and await db.playing(chat_id)
                         )
-
-                        try:
-                            await log_call_lifecycle_snapshot(
-                                "BEFORE_LEAVE",
-                                client,
+                        if needs_native_reset and active_session:
+                            self.controller.mark_network_interruption(
                                 chat_id,
+                                reason="duplicate native initialization during active playback",
                             )
-                        except Exception:
-                            pass
-
-                        try:
-                            await client.leave_call(chat_id, close=False)
-                        except Exception as leave_error:
-                            logger.debug(
-                                f"Recoverable cleanup failed "
-                                f"for {chat_id}: {leave_error}"
-                            )
-
-                        try:
-                            await log_call_lifecycle_snapshot(
-                                "AFTER_LEAVE",
-                                client,
+                            logger.warning(
+                                "VC_GRACE_NO_LEAVE chat_id=%s reason=DuplicateNativeInitialization attempt=%s/%s; preserving active session",
                                 chat_id,
+                                attempt + 1,
+                                max_retries,
                             )
-                        except Exception:
-                            pass
+                        else:
+                            logger.warning(
+                                "VC_RETRY_WITHOUT_LEAVE chat_id=%s reason=RecoverableCallError error=%s attempt=%s/%s",
+                                chat_id,
+                                error_msg,
+                                attempt + 1,
+                                max_retries,
+                            )
+                            if needs_native_reset and not active_session:
+                                logger.warning(
+                                    "VC_REBUILD_REASON chat_id=%s reason=DuplicateNativeInitialization without active session",
+                                    chat_id,
+                                )
+                                try:
+                                    await log_call_lifecycle_snapshot(
+                                        "BEFORE_LEAVE", client, chat_id
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    await client.leave_call(chat_id, close=False)
+                                except Exception as leave_error:
+                                    logger.debug(
+                                        f"Duplicate-init cleanup failed for {chat_id}: {leave_error}"
+                                    )
 
-                        await asyncio.sleep(delay)
-                        continue
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay * (attempt + 1))
+                            continue
 
+                        # Do not propagate a duplicate-init failure into the generic
+                        # handler, which would stop and clear the active playback.
+                        if needs_native_reset and active_session:
+                            return
                     raise
 
             if seek_time:
@@ -468,11 +457,13 @@ class CallPlayer:
                 except Exception:
                     pass
             await self.controller._queue._play_next_impl(chat_id)
-        except TransportParseException:
-            # all retries failed; during watchdog recovery keep the existing
-            # Python playback state so a later watchdog pass can retry.
-            logger.warning(f"Transport not found for {chat_id} after retries.")
-            if recovery:
+        except TransportParseException as e:
+            # Preserve an already-running session on transient network loss;
+            # the watchdog waits 60 seconds before attempting native VC recovery.
+            logger.warning(f"🌐 Voice transport unavailable for {chat_id}: {e}")
+            if recovery or (await db.get_call(chat_id) and await db.playing(chat_id)):
+                self.controller.mark_network_interruption(chat_id, reason=f"TransportParseException: {e}")
+                logger.warning(f"⏳ Preserving active playback state for recovery: {chat_id}")
                 return
             await self.controller._controls._stop_impl(chat_id)
             if message:
@@ -480,9 +471,11 @@ class CallPlayer:
                     await message.edit_text(_lang["error_no_call"])
                 except Exception:
                     pass
-        except (ConnectionNotFound, TelegramServerError):
-            if recovery:
-                logger.warning(f"⚠️ Recovery Telegram/native connection error for {chat_id}")
+        except (ConnectionNotFound, TelegramServerError) as e:
+            logger.warning(f"🌐 Telegram/native connection unavailable for {chat_id}: {e}")
+            if recovery or (await db.get_call(chat_id) and await db.playing(chat_id)):
+                self.controller.mark_network_interruption(chat_id, reason=f"Telegram/native connection: {e}")
+                logger.warning(f"⏳ Preserving active playback state for recovery: {chat_id}")
                 return
             await self.controller._controls._stop_impl(chat_id)
             if message:
@@ -494,8 +487,9 @@ class CallPlayer:
             error_msg = str(e)
             logger.warning(
                 f"⏱️ Timeout joining voice chat {chat_id} after {max_retries} attempts: {error_msg}")
-            if recovery:
-                logger.warning(f"⏳ Keeping Ghost VC session alive for a later retry: {chat_id}")
+            if recovery or (await db.get_call(chat_id) and await db.playing(chat_id)):
+                self.controller.mark_network_interruption(chat_id, reason=f"TimeoutError: {error_msg}")
+                logger.warning(f"⏳ Keeping active VC session alive for later recovery: {chat_id}")
                 return
             await log_call_lifecycle_snapshot(
                 "JOIN_TIMEOUT_FINAL_BEFORE_STOP",
@@ -519,9 +513,27 @@ class CallPlayer:
             await asyncio.sleep(2)
             await self.controller._queue._play_next_impl(chat_id)
         except Exception as e:
+            error_msg = str(e).lower()
             logger.error(
                 f"Unexpected error in play_media for {chat_id}: {e}", exc_info=True)
+            active_session = recovery or (
+                await db.get_call(chat_id) and await db.playing(chat_id)
+            )
+            network_error = any(token in error_msg for token in (
+                "winerror 1231", "winerror 1232", "winerror 1236",
+                "network is unreachable", "network location", "transport",
+                "connection reset", "connection aborted", "connection timed out",
+                "temporarily unavailable", "timed out",
+                "cannot be initialized more than once",
+            ))
             if recovery:
+                return
+            if active_session and network_error:
+                self.controller.mark_network_interruption(chat_id, reason=f"network exception: {e}")
+                logger.warning(
+                    "Preserving active playback after transient network error for %s",
+                    chat_id,
+                )
                 return
             await self.controller._controls._stop_impl(chat_id)
             if message:

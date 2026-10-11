@@ -16,7 +16,7 @@ from ntgcalls import ConnectionNotFound, TelegramServerError
 import ntgcalls
 from pytgcalls import PyTgCalls, exceptions, types
 from pytgcalls.pytgcalls_session import PyTgCallsSession
-from HasiiMusic import db, logger, userbot
+from HasiiMusic import db, logger, queue, userbot
 
 class CallsManager:
     def __init__(self, controller):
@@ -50,6 +50,13 @@ class CallsManager:
                         chat_id = update.chat_id
                         if chat_id in self.controller._stopping:
                             return
+                        grace_until = getattr(self.controller, "_vc_network_grace", {}).get(chat_id, 0.0)
+                        if asyncio.get_running_loop().time() < grace_until:
+                            logger.warning(
+                                "Ignoring StreamEnded during network grace for %s; current track/queue preserved",
+                                chat_id,
+                            )
+                            return
                         # A delayed StreamEnded can arrive after /stop or queue end.
                         # Do not recreate locks/track state for an already-idle chat.
                         if not await db.get_call(chat_id):
@@ -75,13 +82,52 @@ class CallsManager:
                                 return
                         expected_index = self.controller._track_index.get(chat_id, 0)
                         self.controller.schedule_transition(chat_id, expected_index)
+                elif isinstance(update, types.StreamFrames):
+                    # Diagnostic only: do not change playback behavior.
+                    if not hasattr(self.controller, "_frame_diag_last"):
+                        self.controller._frame_diag_last = {}
+                    now = time.monotonic()
+                    key = (
+                        update.chat_id,
+                        str(update.direction),
+                        str(update.device),
+                    )
+                    last = self.controller._frame_diag_last.get(key, 0)
+                    # Log at most once every 30 seconds per stream.
+                    if now - last >= 30:
+                        self.controller._frame_diag_last[key] = now
+                        frames = update.frames or []
+                        total_bytes = sum(
+                            len(frame.frame)
+                            for frame in frames
+                            if frame.frame is not None
+                        )
+                        logger.info(
+                            "StreamFrames diagnostic: "
+                            f"chat={update.chat_id}, "
+                            f"direction={update.direction}, "
+                            f"device={update.device}, "
+                            f"frames={len(frames)}, "
+                            f"bytes={total_bytes}"
+                        )
                 elif isinstance(update, types.ChatUpdate):
-                    if update.status in [
-                        types.ChatUpdate.Status.KICKED,
+                    if update.status == types.ChatUpdate.Status.KICKED:
+                        # A real kick is not a transient network interruption.
+                        await self.controller._controls.stop(update.chat_id)
+                    elif update.status in [
                         types.ChatUpdate.Status.LEFT_GROUP,
                         types.ChatUpdate.Status.CLOSED_VOICE_CHAT,
                     ]:
-                        await self.controller._controls.stop(update.chat_id)
+                        chat_id = update.chat_id
+                        has_session = await db.get_call(chat_id) and queue.get_current(chat_id) is not None
+                        if has_session and await db.playing(chat_id):
+                            # Do not call stop(): transient disconnects can produce
+                            # these updates and stop() clears the queue and DB marker.
+                            self.controller.mark_network_interruption(
+                                chat_id, reason=f"ChatUpdate:{update.status}"
+                            )
+                        else:
+                            await self.controller._controls.stop(chat_id)
             except (ConnectionNotFound, exceptions.NotInCallError, TelegramServerError):
                 return
             except Exception as e:

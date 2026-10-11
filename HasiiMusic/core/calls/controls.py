@@ -27,11 +27,12 @@ class CallControls:
                 await db.playing(chat_id, paused=True)
                 return True
             except (ConnectionNotFound, exceptions.NotInCallError):
-                await db.playing(chat_id, paused=False)
-                await db.remove_call(chat_id)
-                queue.clear(chat_id)
+                # A missing native VC is not an explicit user stop. Preserve the
+                # active-call marker and queue so the per-chat watchdog can recover.
+                if await db.get_call(chat_id):
+                    await db.playing(chat_id, paused=False)
                 logger.warning(
-                    f"Pause requested but assistant not in call for {chat_id}, syncing state")
+                    f"Pause found no native VC for {chat_id}; preserving queue/session for watchdog recovery")
                 return False
             except Exception as e:
                 await db.playing(chat_id, paused=False)
@@ -46,11 +47,11 @@ class CallControls:
                 await db.playing(chat_id, paused=False)
                 return True
             except (ConnectionNotFound, exceptions.NotInCallError):
-                await db.playing(chat_id, paused=False)
-                await db.remove_call(chat_id)
-                queue.clear(chat_id)
+                # Do not erase the only recovery source on a transient VC loss.
+                if await db.get_call(chat_id):
+                    await db.playing(chat_id, paused=False)
                 logger.warning(
-                    f"Resume requested but assistant not in call for {chat_id}, syncing state")
+                    f"Resume found no native VC for {chat_id}; preserving queue/session for watchdog recovery")
                 return False
             except Exception as e:
                 logger.error(f"Resume failed for {chat_id}: {e}")
