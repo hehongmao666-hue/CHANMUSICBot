@@ -70,6 +70,11 @@ class TgCall(PyTgCalls):
         except RuntimeError:
             return
 
+        # A confirmed active session receiving a transient network/VC closure
+        # must not remain blocked by a stale stop marker from an earlier failed
+        # cleanup attempt. Explicit /stop clears the active-call marker and queue,
+        # so it will not enter this branch in manager.py.
+        self._stopping.discard(chat_id)
         previous_until = self._vc_network_grace.get(chat_id, 0.0)
         if previous_until <= now:
             self._vc_network_grace[chat_id] = now + 60.0
@@ -167,15 +172,17 @@ class TgCall(PyTgCalls):
             logger.debug(f"Idle state cleanup failed for {chat_id}: {e}")
 
     async def _native_call_ids(self):
-        """Return active native chat ids when ntgcalls exposes them.
+        """Return active chat ids using native binding, then public PyTgCalls state.
 
-        ntgcalls 3.x exposes ``calls()`` as a mapping keyed by chat id.
-        Keeping the ids lets us clean stale chats individually even while
-        another group is still playing.  ``None`` means the binding did not
-        expose a usable mapping.
+        ntgcalls builds do not all expose the same ``binding.calls()`` return
+        type. Some return a mapping/sequence while others expose a count or
+        raise. If the native API is unavailable, fall back to each PyTgCalls
+        client's public ``calls`` mapping. Return None only when neither view
+        could be read; an empty set means the calls were successfully checked
+        and none are active.
         """
         active = set()
-        seen = False
+        native_seen = False
         for client in list(self.clients):
             binding = getattr(client, "_binding", None)
             accessor = getattr(binding, "calls", None) if binding is not None else None
@@ -187,14 +194,34 @@ class TgCall(PyTgCalls):
                     result = await result
                 if isinstance(result, dict):
                     active.update(result.keys())
-                    seen = True
+                    native_seen = True
                 elif isinstance(result, (list, tuple, set, frozenset)):
-                    # Some binding builds may return a sequence of chat ids.
                     active.update(result)
-                    seen = True
+                    native_seen = True
             except Exception:
                 continue
-        return active if seen else None
+
+        # Also merge the public call map. Some installations have multiple
+        # assistant clients with different native binding behavior.
+        public_seen = False
+        for client in list(self.clients):
+            try:
+                public_calls = client.calls
+                if inspect.isawaitable(public_calls):
+                    public_calls = await public_calls
+                if isinstance(public_calls, dict):
+                    active.update(public_calls.keys())
+                    public_seen = True
+                elif isinstance(public_calls, (list, tuple, set, frozenset)):
+                    active.update(
+                        getattr(call, "chat_id", call)
+                        for call in public_calls
+                    )
+                    public_seen = True
+            except Exception:
+                continue
+
+        return active if (native_seen or public_seen) else None
 
     async def _native_playback_idle(self, chat_id: int) -> bool:
         """Inspect native playback state; log failures for diagnosis."""
@@ -516,16 +543,40 @@ class TgCall(PyTgCalls):
                 )
                 for chat_id in list(candidate_chats):
                     try:
-                        if chat_id in self._stopping:
-                            logger.warning(
-                                f"VC watchdog skipped chat={chat_id}: "
-                                f"marked stopping; stopping={sorted(self._stopping)}"
-                            )
-                            self._vc_recovery_state.pop(chat_id, None)
-                            continue
-
                         has_call = await db.get_call(chat_id)
                         has_current_media = queue.get_current(chat_id) is not None
+
+                        if chat_id in self._stopping:
+                            # A completed stop has no active marker and no current
+                            # media. Retire its stale marker instead of leaking it.
+                            if not has_call and not has_current_media:
+                                self._stopping.discard(chat_id)
+                                self._vc_recovery_state.pop(chat_id, None)
+                                self._vc_network_grace.pop(chat_id, None)
+                                logger.info(
+                                    f"VC watchdog cleared completed stop marker for {chat_id}"
+                                )
+                                continue
+
+                            # A transient network close can race with a previous
+                            # failed stop. Once the grace period has elapsed and
+                            # native VC is absent, allow recovery to take ownership.
+                            now_check = asyncio.get_running_loop().time()
+                            grace_until_check = self._vc_network_grace.get(chat_id, 0.0)
+                            if (chat_id not in active_ids and grace_until_check
+                                    and now_check >= grace_until_check):
+                                self._stopping.discard(chat_id)
+                                logger.warning(
+                                    f"VC watchdog released stale stopping marker for {chat_id}; "
+                                    "active playback exists but native VC is missing"
+                                )
+                            else:
+                                logger.warning(
+                                    f"VC watchdog skipped chat={chat_id}: "
+                                    f"marked stopping; stopping={sorted(self._stopping)}"
+                                )
+                                continue
+
                         logger.info(
                             f"VC watchdog candidate chat={chat_id}, "
                             f"has_call={has_call}, "
@@ -660,7 +711,17 @@ class TgCall(PyTgCalls):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"VC watchdog stopped unexpectedly: {e}", exc_info=True)
+            logger.error(
+                f"VC watchdog stopped unexpectedly: {e}; retrying startup in 5 seconds",
+                exc_info=True,
+            )
+            # A single unexpected inspection error must not permanently disable
+            # automatic recovery for every group. Cancellation still exits cleanly.
+            await asyncio.sleep(5)
+            self._vc_watchdog_task = asyncio.create_task(
+                self._vc_watchdog_loop(),
+                name="vc_ghost_watchdog",
+            )
 
     def start_vc_watchdog(self) -> None:
         if self._vc_watchdog_task is None or self._vc_watchdog_task.done():

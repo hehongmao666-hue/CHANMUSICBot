@@ -58,100 +58,128 @@ class CallControls:
                 return False
 
     async def stop(self, chat_id: int) -> None:
-        async with self.controller.get_lock(chat_id):
-            await self._stop_impl(chat_id)
+        # Do not wait on the per-chat playback lock here. A stuck play/recovery
+        # task may own it indefinitely; /stop must remain an escape hatch.
+        await self._stop_impl(chat_id)
 
     async def _stop_impl(self, chat_id: int) -> None:
+        """Best-effort hard stop that always clears local playback state.
+
+        This method deliberately does not acquire the per-chat lock because it is
+        also called by queue/player code that may already hold it, and a network
+        failure can otherwise make /stop wait forever.
+        """
         self.controller._stopping.add(chat_id)
+        self.controller._vc_network_grace.pop(chat_id, None)
+        self.controller._vc_recovery_state.pop(chat_id, None)
         self.controller._session_gen[chat_id] = self.controller._session_gen.get(chat_id, 0) + 1
 
-        transition = self.controller._transition_tasks.get(chat_id)
         current_task = asyncio.current_task()
+        transition = self.controller._transition_tasks.get(chat_id)
         if transition is not None and transition is not current_task and not transition.done():
             transition.cancel()
             try:
-                await transition
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
+                await asyncio.wait_for(asyncio.gather(transition, return_exceptions=True), timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning(f"Stop: transition task did not finish promptly for {chat_id}")
         self.controller._transition_tasks.pop(chat_id, None)
-        client = await db.get_assistant(chat_id)
+        self.controller._pending_transitions.discard(chat_id)
 
-        # Cancel background playlist expansion before clearing the queue.
-        # A late playlist fetch must never repopulate a stopped chat.
-        try:
-            await self.controller._queue.cancel_playlist_tasks(chat_id)
-        except Exception as e:
-            logger.debug(f"Error cancelling playlist task for {chat_id}: {e}")
-
-        # Cancel any active preload tasks when stopping
-        try:
-            await preload.cancel_preload(chat_id)
-        except Exception as e:
-            logger.debug(f"Error cancelling preload for {chat_id}: {e}")
-
+        # Clear user-visible/local state first. A database outage must not leave
+        # the bot permanently reporting that playback is active.
         try:
             queue.clear(chat_id)
-            try:
-                self.controller._queue._autoplay_recent.pop(chat_id, None)
-            except Exception:
-                pass
+        except Exception as e:
+            logger.warning(f"Stop: queue.clear failed for {chat_id}: {e}")
+        try:
+            self.controller._autoplay_recent.pop(chat_id, None)
+            self.controller._autoplay_failed.pop(chat_id, None)
+        except Exception:
+            pass
+        try:
             await db.remove_call(chat_id)
         except Exception as e:
-            logger.warning(f"Error clearing queue/call for {chat_id}: {e}")
+            logger.warning(f"Stop: active-call marker cleanup failed for {chat_id}: {e}")
+
+        # Cancel background producers with timeouts so a stuck task cannot block
+        # the remainder of stop cleanup.
+        for label, operation in (
+            ("playlist", self.controller._queue.cancel_playlist_tasks(chat_id)),
+            ("preload", preload.cancel_preload(chat_id)),
+        ):
+            try:
+                await asyncio.wait_for(operation, timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Stop: {label} cancellation timed out for {chat_id}")
+            except Exception as e:
+                logger.debug(f"Stop: {label} cancellation failed for {chat_id}: {e}")
+
+        # Resolve the assistant only after local state is already cleared. MongoDB
+        # may be unreachable, so fall back to clients that report this call.
+        clients_to_leave = []
+        try:
+            client = await asyncio.wait_for(db.get_assistant(chat_id), timeout=3.0)
+            if client is not None:
+                clients_to_leave.append(client)
+        except Exception as e:
+            logger.warning(f"Stop: could not resolve assigned assistant for {chat_id}: {e}")
 
         try:
-            native_ids = await self.controller._native_call_ids()
+            native_ids = await asyncio.wait_for(self.controller._native_call_ids(), timeout=3.0)
+        except Exception:
+            native_ids = None
+        if native_ids is None or chat_id in native_ids:
+            try:
+                public_clients = list(self.controller.clients)
+            except Exception:
+                public_clients = []
+            for candidate in public_clients:
+                if candidate not in clients_to_leave:
+                    try:
+                        calls = await asyncio.wait_for(candidate.calls, timeout=2.0)
+                        if calls and chat_id in calls:
+                            clients_to_leave.append(candidate)
+                    except Exception:
+                        # If call ownership cannot be queried, only use the assigned
+                        # client; do not issue leave_call against every assistant.
+                        continue
 
-            if native_ids is not None and chat_id not in native_ids:
-                logger.debug(
-                    f"Skip leave_call for inactive chat {chat_id}; "
-                    f"native_calls={sorted(native_ids)}"
-                )
-            else:
-                await log_call_lifecycle_snapshot(
-                    "BEFORE_LEAVE",
-                    client,
-                    chat_id,
-                )
-
-                await client.leave_call(
-                    chat_id,
-                    close=False,
-                )
-
-                await log_call_lifecycle_snapshot(
-                    "AFTER_LEAVE",
-                    client,
-                    chat_id,
-                )
-
-                await asyncio.sleep(0.5)
-
-        except (ConnectionNotFound, exceptions.NotInCallError):
-            # the userbot is already out of the call
-            pass
-        except Exception as e:
-            # unexpected errors
-            error_msg = str(e).lower()
-            if not any(ignore in error_msg for ignore in [
-                "not in a call",
-                "not in the group call",
-                "groupcall_forbidden",
-                "no active group call",
-                "call was already stopped",
-                "call already disconnected"
-            ]):
-                logger.warning(f"Error leaving call for {chat_id}: {e}")
-
-        # Do not keep per-chat locks/counters forever after the voice session
-        # is gone.  The delayed cleanup also trims Linux heap pages after the
-        # native voice/download workload has released its buffers.
-        generation = self.controller._session_gen.get(chat_id, 0)
-        asyncio.create_task(
-            self.controller.cleanup_chat_state(chat_id, generation)
-        )
+        try:
+            for client in clients_to_leave:
+                try:
+                    await log_call_lifecycle_snapshot("BEFORE_LEAVE", client, chat_id)
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(client.leave_call(chat_id, close=False), timeout=5.0)
+                    try:
+                        await log_call_lifecycle_snapshot("AFTER_LEAVE", client, chat_id)
+                    except Exception:
+                        pass
+                    logger.info(f"Stop: leave_call completed for {chat_id}")
+                except (ConnectionNotFound, exceptions.NotInCallError):
+                    pass
+                except asyncio.TimeoutError:
+                    logger.warning(f"Stop: leave_call timed out for {chat_id}")
+                except Exception as e:
+                    message = str(e).lower()
+                    if not any(ignore in message for ignore in (
+                        "not in a call", "not in the group call", "groupcall_forbidden",
+                        "no active group call", "call was already stopped", "call already disconnected"
+                    )):
+                        logger.warning(f"Stop: leave_call failed for {chat_id}: {e}")
+        finally:
+            # This is the essential anti-deadlock guarantee: stale stop/recovery
+            # markers must not permanently block /play or the watchdog.
+            self.controller._vc_recovery_state.pop(chat_id, None)
+            self.controller._vc_network_grace.pop(chat_id, None)
+            self.controller._pending_transitions.discard(chat_id)
+            self.controller._play_started_at.pop(chat_id, None)
+            self.controller._play_duration.pop(chat_id, None)
+            self.controller._track_index.pop(chat_id, None)
+            self.controller._stopping.discard(chat_id)
+            generation = self.controller._session_gen.get(chat_id, 0)
+            asyncio.create_task(self.controller.cleanup_chat_state(chat_id, generation))
 
     async def seek_stream(self, chat_id: int, seconds: int) -> bool:
         """seek to a position in the current stream"""
