@@ -15,12 +15,16 @@ import re
 import unicodedata
 from difflib import SequenceMatcher
 from pyrogram import errors
+from pymongo.errors import ConnectionFailure
 from HasiiMusic import app, config, db, lang, logger, preload, queue, yt
 
 class CallQueue:
     def __init__(self, controller):
         self.controller = controller
         self._playlist_tasks = {}
+        # One delayed retry task per chat; avoid duplicate queue transitions on DB outages.
+        self._db_retry_tasks = {}
+        self._db_retry_keys = {}
 
     async def replay(self, chat_id: int) -> None:
         try:
@@ -55,12 +59,28 @@ class CallQueue:
             self.controller._track_index[chat_id] = self.controller._track_index.get(chat_id, 0) + 1
             await self._play_next_impl(chat_id)
 
-    async def _play_next_impl(self, chat_id: int) -> None:
+    async def _play_next_impl(
+        self, chat_id: int, loop_mode_override: int | None = None
+    ) -> None:
         try:
             if not await db.get_call(chat_id):
                 return
 
-            loop_mode = await db.get_loop(chat_id)
+            if loop_mode_override is None:
+                try:
+                    loop_mode = await db.get_loop(chat_id)
+                except ConnectionFailure as e:
+                    logger.warning(
+                        f"MongoDB connection failed while reading loop mode for {chat_id}; "
+                        f"preserving queue and scheduling recovery: {type(e).__name__}: "
+                        f"{str(e).replace(chr(10), ' ').replace(chr(13), ' ')[:180]}"
+                    )
+                    self._schedule_db_retry(chat_id)
+                    return
+                else:
+                    self._clear_db_retry(chat_id)
+            else:
+                loop_mode = loop_mode_override
 
             if loop_mode == 1:
                 media = queue.get_current(chat_id)
@@ -409,6 +429,105 @@ class CallQueue:
                 await self.controller._controls._stop_impl(chat_id)
             except Exception:
                 pass
+
+    def _clear_db_retry(self, chat_id: int) -> None:
+        """Cancel stale delayed DB recovery when a normal transition succeeds."""
+        task = self._db_retry_tasks.get(chat_id)
+        current_task = asyncio.current_task()
+        if task is not None and task is not current_task and not task.done():
+            task.cancel()
+        if task is not current_task:
+            self._db_retry_tasks.pop(chat_id, None)
+        self._db_retry_keys.pop(chat_id, None)
+
+    def _schedule_db_retry(self, chat_id: int) -> None:
+        """Schedule one cancellable recovery for the same queue transition."""
+        if chat_id in self.controller._stopping:
+            return
+
+        generation = self.controller._session_gen.get(chat_id, 0)
+        track_index = self.controller._track_index.get(chat_id, 0)
+        retry_key = (generation, track_index)
+        existing = self._db_retry_tasks.get(chat_id)
+        if existing is not None and not existing.done():
+            if self._db_retry_keys.get(chat_id) == retry_key:
+                return
+            # Do not cancel the currently running retry task from inside itself.
+            if existing is not asyncio.current_task():
+                existing.cancel()
+
+        self._db_retry_keys[chat_id] = retry_key
+        task = asyncio.create_task(
+            self._retry_db_transition(chat_id, generation, track_index),
+            name=f"mongo_queue_retry:{chat_id}",
+        )
+        self._db_retry_tasks[chat_id] = task
+
+    async def _retry_db_transition(
+        self, chat_id: int, generation: int, track_index: int
+    ) -> None:
+        """Retry the failed loop-mode read with capped backoff, without stopping playback."""
+        current_task = asyncio.current_task()
+        retry_key = (generation, track_index)
+        delay = 2
+        attempt = 0
+
+        async def still_current() -> bool:
+            return (
+                chat_id not in self.controller._stopping
+                and self.controller._session_gen.get(chat_id, 0) == generation
+                and self.controller._track_index.get(chat_id, 0) == track_index
+                and self._db_retry_keys.get(chat_id) == retry_key
+                and await db.get_call(chat_id)
+            )
+
+        try:
+            while True:
+                if not await still_current():
+                    return
+                await asyncio.sleep(delay)
+                if not await still_current():
+                    return
+
+                retry_failed = False
+                lock = self.controller.get_lock(chat_id)
+                async with lock:
+                    if not await still_current():
+                        return
+                    try:
+                        loop_mode = await db.get_loop(chat_id)
+                    except ConnectionFailure as e:
+                        attempt += 1
+                        retry_failed = True
+                        next_delay = min(delay * 2, 30)
+                        logger.warning(
+                            f"MongoDB queue recovery attempt {attempt} failed for {chat_id} "
+                            f"({type(e).__name__}); retrying in {next_delay}s"
+                        )
+                    else:
+                        logger.info(
+                            f"MongoDB connection recovered for queue transition in {chat_id}; "
+                            "resuming without clearing the queue"
+                        )
+                        self._db_retry_keys.pop(chat_id, None)
+                        await self._play_next_impl(
+                            chat_id, loop_mode_override=loop_mode
+                        )
+                        return
+
+                if retry_failed:
+                    delay = min(delay * 2, 30)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                f"MongoDB queue recovery task failed for {chat_id}: {e}", exc_info=True
+            )
+        finally:
+            if self._db_retry_tasks.get(chat_id) is current_task:
+                self._db_retry_tasks.pop(chat_id, None)
+                if self._db_retry_keys.get(chat_id) == retry_key:
+                    self._db_retry_keys.pop(chat_id, None)
 
     def _schedule_playlist_batch(
         self, chat_id: int, playlist_url: str, user: str, offset: int, limit: int
